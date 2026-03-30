@@ -1,0 +1,4 @@
+interface:
+  display_name: "Veil Integration"
+  short_description: "Integrate Veil into static-site and GitHub Pages deploys"
+  default_prompt: "Use $veil-integration to protect a static site or GitHub Pages subtree with Veil, wire the build and deploy flow, set secrets, and verify unlock behavior."
