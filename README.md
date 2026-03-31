@@ -6,6 +6,9 @@ Encrypt static HTML sites at build time. Veil wraps each HTML file in a self-con
 
 **Not for:** regulated data, identity-based access control, or protecting against a compromised host.
 
+> [!WARNING]
+> **Veil is deterrence, not absolute security.** It protects against casual browsing and search indexing. It does **not** protect against a compromised host or weak passphrases. **Only HTML files are encrypted;** images, CSS, and JS files remain public in the output directory.
+
 ## Quick Start
 
 ```bash
@@ -114,6 +117,18 @@ Veil is deterrence on public static hosting, not strong access control. It prote
 - Metadata leakage (page count, file sizes, directory structure)
 
 The right mental model: the alternative was leaving it fully public.
+
+## See Also
+
+[StatiCrypt](https://github.com/robinmoisson/staticrypt) is a more established tool in this space with custom templates, share links, and a decrypt mode. Veil differs in a few ways:
+
+- **Authenticated encryption** — Veil uses AES-256-GCM (detects tampered ciphertext); StatiCrypt uses AES-256-CBC (confidentiality only).
+- **Envelope encryption** — Veil caches a site-specific master key in the browser, never the raw passphrase. StatiCrypt stores a salted password hash.
+- **Auto-inlining** — Veil inlines local CSS/JS into each encrypted page automatically.
+- **Selective encryption** — `--html-root` encrypts subtrees while leaving other pages public.
+- **Zero dependencies** — Veil is a single file with no npm install.
+
+If you need custom prompt templates, share links, or configurable remember-me expiry, StatiCrypt is the more mature choice. If you want authenticated encryption, auto-inlining, subtree control, or a single vendorable file, Veil is a better fit.
 
 ## Requirements
 

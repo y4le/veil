@@ -117,6 +117,26 @@ After resolving the questions above, follow the appropriate reference:
 | Full-site encryption | Every page is protected behind one passphrase | [github-pages.md](skills/veil-integration/references/github-pages.md) | `https://raw.githubusercontent.com/y4le/veil/main/.agents/skills/veil-integration/references/github-pages.md` |
 | Protected zones | Public landing page + individually protected sections | [protected-zones.md](skills/veil-integration/references/protected-zones.md) | `https://raw.githubusercontent.com/y4le/veil/main/.agents/skills/veil-integration/references/protected-zones.md` |
 
+### Verification
+
+Always verify the integration by checking that the output directory does not contain raw source strings from the input HTML.
+
+```bash
+# Search for a known string from the source HTML in the encrypted output
+grep -r "Your Source String" ./encrypted-output || echo "Verified: Source content not found in output."
+```
+
+### Generic CI Snippet
+
+For non-GitHub CI (GitLab, Bitbucket, etc.), ensure the passphrase is provided via an environment variable:
+
+```bash
+# Example for a generic shell-based CI
+node ./tools/veil.js ./dist ./public \
+  --passphrase-env VEIL_PASSPHRASE \
+  --id my-project
+```
+
 For integration guardrails and verification standards, read the [integration skill guide](skills/veil-integration/SKILL.md).
 
 If you want future agents inside the target repo to auto-discover this guidance, copy `.agents/` into the target repo after integration.

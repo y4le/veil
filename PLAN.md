@@ -171,7 +171,7 @@ passphrase
 | Page encryption | AES-256-GCM | Authenticated encryption |
 | MK wrapping | AES-256-GCM | Reuse native primitives already available |
 | KDF | PBKDF2-HMAC-SHA256 | Native in Node and browser |
-| PBKDF2 iterations | `600000` default | Persisted in payload metadata |
+| PBKDF2 iterations | `600000` default | Persisted in payload metadata (~500ms delay on modern hardware) |
 | KEK salt | 16 random bytes per build | Shared across pages in the same build |
 | Page IV | 12 random bytes per file | Never reused with same key |
 | Wrap IV | 12 random bytes per build | Used to wrap `MK` |
