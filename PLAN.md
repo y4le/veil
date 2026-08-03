@@ -246,7 +246,7 @@ Expected prompt behavior:
 - wrong-passphrase error state
 - hidden by default so successful auto-unlock does not flash the prompt
 
-The wrapper preserves the source page title and emits a baseline meta CSP for the shell.
+The wrapper uses a constant title ("Protected page") plus a `noindex` robots meta so page titles never leak into the public artifact; the real title returns with the decrypted document. The wrapper emits a meta CSP that persists through `document.write` and therefore governs decrypted pages as well: same-origin passive assets and inline scripts are allowed, all `<script src>` loads are blocked.
 
 ## Asset Strategy
 

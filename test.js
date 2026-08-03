@@ -473,7 +473,6 @@ describe('encryption', () => {
     assert.equal(payload.v, 1);
     assert.equal(payload.siteId, 'my-site');
     assert.equal(payload.iterations, 200000);
-    assert.equal(payload.title, 'My Title');
     assert.equal(payload.remember, false);
   });
 
@@ -579,7 +578,7 @@ describe('wrapper HTML', () => {
     cleanup(dir);
   });
 
-  it('produces valid HTML with CSP', () => {
+  it('produces valid HTML with CSP, noindex, and hidden prompt', () => {
     const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
     const outDir = path.join(dir, 'out-wrapper');
     run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
@@ -587,25 +586,25 @@ describe('wrapper HTML', () => {
     assert.match(wrapper, /<!DOCTYPE html>/);
     assert.match(wrapper, /Content-Security-Policy/);
     assert.match(wrapper, /default-src 'none'/);
+    assert.match(wrapper, /img-src 'self' data:/);
+    assert.match(wrapper, /base-uri 'self'/);
+    assert.match(wrapper, /name="robots" content="noindex,nofollow,noarchive"/);
+    // Prompt starts hidden so cached auto-unlock never flashes it
+    assert.match(wrapper, /class="veil-prompt veil-hidden"/);
     assert.match(wrapper, /veil-payload/);
-    assert.match(wrapper, /veil-prompt/);
     assert.match(wrapper, /veil-form/);
   });
 
-  it('preserves page title', () => {
-    const siteDir = setupSite(dir, { 'index.html': '<html><head><title>My Page</title></head><body>x</body></html>' });
+  it('does not leak the source page title into the wrapper', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><head><title>Acme acquisition proposal</title></head><body>x</body></html>' });
     const outDir = path.join(dir, 'out-title');
     run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
     const wrapper = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
-    assert.match(wrapper, /<title>My Page<\/title>/);
-  });
-
-  it('escapes HTML entities in title', () => {
-    const siteDir = setupSite(dir, { 'index.html': '<html><head><title>A & B <C></title></head><body>x</body></html>' });
-    const outDir = path.join(dir, 'out-escape');
-    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
-    const wrapper = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
-    assert.match(wrapper, /A &amp; B &lt;C&gt;/);
+    assert.ok(!wrapper.includes('Acme'), 'source title must not appear in the public wrapper');
+    assert.match(wrapper, /<title>Protected page<\/title>/);
+    // The real title is restored from the decrypted document itself
+    const html = decryptPayload(extractPayload(wrapper), 'test');
+    assert.match(html, /<title>Acme acquisition proposal<\/title>/);
   });
 
   it('embeds script payload as valid JSON, not HTML-escaped JSON', () => {
@@ -616,7 +615,7 @@ describe('wrapper HTML', () => {
     const match = wrapper.match(/<script id="veil-payload" type="application\/json">([^<]+)<\/script>/);
     assert.ok(match);
     assert.doesNotMatch(match[1], /&quot;|&lt;|&gt;|&amp;/);
-    assert.equal(JSON.parse(match[1]).title, 'Quote " Test');
+    assert.equal(JSON.parse(match[1]).title, 'Protected page');
   });
 
   it('copies non-HTML files', () => {
@@ -629,14 +628,6 @@ describe('wrapper HTML', () => {
     run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
     assert.equal(fs.readFileSync(path.join(outDir, 'image.png'), 'utf8'), 'fake-png-data');
     assert.equal(fs.readFileSync(path.join(outDir, 'sub', 'data.json'), 'utf8'), '{"key":"value"}');
-  });
-
-  it('uses fallback title for pages without <title>', () => {
-    const siteDir = setupSite(dir, { 'index.html': '<html><body>no title here</body></html>' });
-    const outDir = path.join(dir, 'out-notitle');
-    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
-    const wrapper = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
-    assert.match(wrapper, /<title>Protected Page<\/title>/);
   });
 
   it('checks "remember" by default when --remember is set', () => {

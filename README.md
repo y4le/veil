@@ -30,6 +30,20 @@ Open `http://127.0.0.1:8765` — every page prompts for the passphrase, then dec
 
 Non-HTML files (images, fonts, data) are copied as-is. They remain public.
 
+Runtime behavior worth knowing:
+
+- **HTTPS required.** Web Crypto only exists in secure contexts (HTTPS,
+  localhost, or `file:`). On plain HTTP the wrapper shows a clear error.
+- **The wrapper CSP governs decrypted pages too.** It allows same-origin
+  images, fonts, media, stylesheets, and fetches, plus inline scripts and
+  styles. It blocks every `<script src>` — same-origin or external. Inlining
+  (the default) converts local scripts to inline ones; external/third-party
+  scripts never run on protected pages, which also protects the cached key
+  in browser storage. With `--no-inline`, local JS will not execute.
+- **Titles are not leaked.** The public wrapper always says "Protected page"
+  (with a `noindex` robots meta); the real title appears after decryption.
+- **Lock/logout.** The 🔒 button or `?veil=logout` clears cached keys.
+
 ## CLI
 
 ```
@@ -140,5 +154,7 @@ If you need custom prompt templates, share links, or configurable remember-me ex
 
 ## Requirements
 
-- Node.js 18+
-- No npm dependencies
+- Node.js 18+ (running `veil.js` itself)
+- No runtime npm dependencies
+- Development only: Node.js 20+ and Playwright (`npm install` +
+  `npx playwright install chromium`) for the browser test suite

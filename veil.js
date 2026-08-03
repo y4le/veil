@@ -374,7 +374,8 @@ function generateWrapper(pageData) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' 'self'; img-src 'self' data:; font-src 'self' data:; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'self'">
+<meta name="robots" content="noindex,nofollow,noarchive">
 <title>${escapeHtml(pageData.title)}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -395,7 +396,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 </style>
 </head>
 <body>
-<div class="veil-prompt" id="veil-prompt">
+<div class="veil-prompt veil-hidden" id="veil-prompt">
 <h1>This page is protected</h1>
 <form id="veil-form" autocomplete="off">
 <input type="password" id="veil-pass" placeholder="Passphrase" autofocus autocomplete="current-password">
@@ -408,13 +409,38 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <script>
 (function(){
 'use strict';
-var D=document,W=window,S=W.crypto.subtle;
+var D=document,W=window;
+var S=(W.crypto&&W.crypto.subtle)||null;
 var data=JSON.parse(D.getElementById('veil-payload').textContent);
 var SK='veil:v'+data.v+':'+data.siteId+':mk';
 var aadStr='veil:v'+data.v+':'+data.siteId;
 
 function b64(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)})}
 function toAb(u){return u.buffer.slice(u.byteOffset,u.byteOffset+u.byteLength)}
+
+function showPrompt(){
+D.getElementById('veil-prompt').classList.remove('veil-hidden');
+try{D.getElementById('veil-pass').focus()}catch(e){}
+}
+function setError(msg){D.getElementById('veil-error').textContent=msg}
+
+// Storage access can throw (disabled cookies, sandboxed frames); every
+// touch is guarded so storage problems degrade to the prompt, never to a
+// dead page.
+function getStore(name){try{return W[name]}catch(e){return null}}
+function sGet(store){if(!store)return null;try{return store.getItem(SK)}catch(e){return null}}
+function sDel(store){if(!store)return;try{store.removeItem(SK)}catch(e){}}
+function parseMk(s){
+if(typeof s!=='string')return null;
+try{
+var u=Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)});
+if(u.length!==32)return null;
+// atob is permissive (whitespace, missing padding); require the exact
+// canonical encoding we store, so validation is strict.
+if(btoa(String.fromCharCode.apply(null,u))!==s)return null;
+return u;
+}catch(e){return null}
+}
 
 function importMk(raw){
 return S.importKey('raw',raw,{name:'AES-GCM'},false,['decrypt']);
@@ -436,24 +462,24 @@ lock.title='Lock (forget passphrase)';
 lock.onclick=function(){doLogout()};
 var s=D.createElement('style');
 s.textContent='.veil-lock{position:fixed;top:12px;right:12px;background:none;border:none;color:#666;font-size:1.25rem;cursor:pointer;padding:4px 8px;z-index:99999;opacity:.5;transition:opacity .2s}.veil-lock:hover{opacity:1}';
-D.body.appendChild(s);D.body.appendChild(lock);
+var host=D.body||D.documentElement;
+host.appendChild(s);host.appendChild(lock);
 }
 
 function cacheMk(raw,persist){
 var b64mk=btoa(String.fromCharCode.apply(null,new Uint8Array(raw)));
-try{sessionStorage.setItem(SK,b64mk)}catch(e){}
-if(persist){try{localStorage.setItem(SK,b64mk)}catch(e){}}
+var ss=getStore('sessionStorage'),ls=getStore('localStorage');
+if(ss){try{ss.setItem(SK,b64mk)}catch(e){}}
+if(persist&&ls){try{ls.setItem(SK,b64mk)}catch(e){}}
 }
 
-function getCachedMk(){
-var s=sessionStorage.getItem(SK)||localStorage.getItem(SK);
-if(!s)return null;
-return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)});
+function clearAll(){
+sDel(getStore('sessionStorage'));
+sDel(getStore('localStorage'));
 }
 
 function doLogout(){
-try{sessionStorage.removeItem(SK)}catch(e){}
-try{localStorage.removeItem(SK)}catch(e){}
+clearAll();
 W.location.reload();
 }
 
@@ -474,26 +500,52 @@ return S.decrypt({name:'AES-GCM',iv:toAb(wrapIv),additionalData:toAb(aad),tagLen
 });
 }
 
-// Check for logout
-if(W.location.search.indexOf('veil=logout')!==-1){
-doLogout();
+// Explicit logout: clear cached keys, then navigate to the same page
+// without the veil parameter (a plain reload would re-trigger this branch
+// forever).
+var params=null;
+try{params=new URLSearchParams(W.location.search)}catch(e){}
+if(params&&params.getAll('veil').indexOf('logout')!==-1){
+clearAll();
+params.delete('veil');
+var q=params.toString();
+W.location.replace(W.location.pathname+(q?'?'+q:'')+W.location.hash);
+return;
 }
 
-// Try cached MK first
-var cached=getCachedMk();
-if(cached){
-importMk(toAb(cached))
+// Web Crypto requires a secure context (HTTPS, localhost, or file).
+if(!S){
+showPrompt();
+setError('Cannot decrypt: this page needs HTTPS (or localhost).');
+D.getElementById('veil-btn').disabled=true;
+return;
+}
+
+// Try cached keys: session tier first, then persistent. A tier that fails
+// (malformed value or stale key from an older build) is cleared and the
+// next tier tried — a bad session value must not destroy a valid
+// remembered key.
+function tryCached(tiers){
+if(!tiers.length){showPrompt();return}
+var t=tiers[0];
+importMk(toAb(t.mk))
 .then(function(k){return decryptPage(k)})
 .then(function(buf){showPage(buf)})
 .catch(function(){
-// Stale cache — clear and show prompt
-try{sessionStorage.removeItem(SK)}catch(e){}
-try{localStorage.removeItem(SK)}catch(e){}
-D.getElementById('veil-prompt').classList.remove('veil-hidden');
+sDel(t.store);
+tryCached(tiers.slice(1));
 });
-}else{
-D.getElementById('veil-prompt').classList.remove('veil-hidden');
 }
+
+var tiers=[];
+['sessionStorage','localStorage'].forEach(function(name){
+var store=getStore(name);
+var raw=sGet(store);
+var mk=parseMk(raw);
+if(mk){tiers.push({mk:mk,store:store})}
+else if(raw!==null){sDel(store)}
+});
+tryCached(tiers);
 
 // Form handler
 D.getElementById('veil-form').addEventListener('submit',function(e){
@@ -501,17 +553,22 @@ e.preventDefault();
 var pass=D.getElementById('veil-pass').value;
 var persist=D.getElementById('veil-rem').checked;
 var btn=D.getElementById('veil-btn');
-var err=D.getElementById('veil-error');
-if(!pass){err.textContent='Please enter a passphrase.';return}
-btn.disabled=true;btn.textContent='Decrypting\\u2026';err.textContent='';
+if(!pass){setError('Please enter a passphrase.');return}
+btn.disabled=true;btn.textContent='Decrypting\\u2026';setError('');
 deriveAndUnwrap(pass)
+.catch(function(){throw 'veil-wrong-pass'})
 .then(function(mkRaw){
-cacheMk(mkRaw,persist);
-return importMk(mkRaw).then(function(k){return decryptPage(k)});
+return importMk(mkRaw)
+.then(function(k){return decryptPage(k)})
+.catch(function(){throw 'veil-corrupt-page'})
+.then(function(buf){cacheMk(mkRaw,persist);showPage(buf)});
 })
-.then(function(buf){showPage(buf)})
-.catch(function(){
-err.textContent='Wrong passphrase. Please try again.';
+.catch(function(err){
+if(err==='veil-corrupt-page'){
+setError('Passphrase accepted, but this page failed to decrypt. The deployed file may be corrupt or from a different build.');
+}else{
+setError('Wrong passphrase. Please try again.');
+}
 btn.disabled=false;btn.textContent='Unlock';
 D.getElementById('veil-pass').select();
 });
@@ -798,17 +855,16 @@ async function main() {
         html = inlineAssets(html, path.dirname(src), opts.inputDir);
       }
 
-      // Extract page title for the wrapper
-      const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-      const pageTitle = titleMatch ? titleMatch[1].trim() : 'Protected Page';
-
       // Encrypt the page
       const { ciphertext, iv } = encryptPage(html, siteKeys.mk, opts.siteId);
 
-      // Build per-page data
+      // Build per-page data. The wrapper title is a constant: the real
+      // page title is content and must not appear in the public wrapper
+      // (document.write restores it after decryption). The payload field
+      // stays until the v2 format removes it from the schema.
       const pageData = {
         ...payloadMeta,
-        title: pageTitle,
+        title: 'Protected page',
         ct: ciphertext.toString('base64'),
         iv: iv.toString('base64'),
       };
