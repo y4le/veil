@@ -455,7 +455,7 @@ return S.importKey('raw',new TextEncoder().encode(passphrase),'PBKDF2',false,['d
 .then(function(baseKey){
 return S.deriveKey(
 {name:'PBKDF2',salt:toAb(salt),iterations:data.iterations,hash:'SHA-256'},
-baseKey,{name:'AES-GCM',length:256},false,['decrypt','unwrapKey']
+baseKey,{name:'AES-GCM',length:256},false,['decrypt']
 );
 })
 .then(function(kek){
@@ -610,7 +610,8 @@ async function main() {
   const files = walkDir(opts.inputDir);
   const allHtmlFiles = files.filter((f) => f.endsWith('.html') || f.endsWith('.htm'));
   const htmlFiles = allHtmlFiles.filter((f) => shouldEncryptHtml(f, opts.htmlRoots));
-  const passthroughFiles = files.filter((f) => !htmlFiles.includes(f));
+  const htmlFileSet = new Set(htmlFiles);
+  const passthroughFiles = files.filter((f) => !htmlFileSet.has(f));
 
   if (allHtmlFiles.length === 0) {
     fatal('No HTML files found in input directory');
@@ -682,5 +683,5 @@ async function main() {
 }
 
 main().catch((err) => {
-  fatal(err.message);
+  fatal(err && err.message ? err.message : String(err));
 });

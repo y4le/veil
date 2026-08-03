@@ -9,7 +9,6 @@ const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
 const VEIL = path.join(__dirname, 'veil.js');
-const FORMAT_VERSION = 1;
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(require('os').tmpdir(), 'veil-test-'));
