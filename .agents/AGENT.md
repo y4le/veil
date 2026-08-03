@@ -170,8 +170,13 @@ Options:
   --remember            Check "Remember this device" by default
   --html-root <dir>     Encrypt only HTML under this relative dir (repeatable)
   --no-inline           Skip local CSS/JS inlining
+  --force               Replace a non-empty output directory
   --help                Show this help
 ```
+
+The output directory is rebuilt from scratch on every run. A non-empty output
+directory is only replaced with `--force` — use that in CI pipelines that
+reuse a build directory. Symlinks inside the input tree are rejected.
 
 ## What Veil Does Not Do
 

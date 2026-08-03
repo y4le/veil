@@ -73,7 +73,7 @@ describe('CLI arguments', () => {
     const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
     const r = run([siteDir, path.join(siteDir, 'dist'), '--passphrase', 'test']);
     assert.equal(r.code, 1);
-    assert.match(r.stderr, /cannot be inside/);
+    assert.match(r.stderr, /cannot be the same as, inside, or contain/);
     cleanup(dir);
   });
 
@@ -148,6 +148,184 @@ describe('CLI arguments', () => {
     assert.equal(r.code, 1);
     assert.match(r.stderr, /cannot escape/);
     cleanup(dir);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Output artifact safety tests
+// ---------------------------------------------------------------------------
+
+describe('output artifact safety', () => {
+  let dir;
+
+  before(() => {
+    dir = tmpDir();
+  });
+
+  after(() => {
+    cleanup(dir);
+  });
+
+  it('refuses a non-empty output directory without --force', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const outDir = path.join(dir, 'out-nonempty');
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, 'stale.html'), '<html><body>OLD SECRET</body></html>');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /not empty/);
+    // Existing content untouched
+    assert.match(fs.readFileSync(path.join(outDir, 'stale.html'), 'utf8'), /OLD SECRET/);
+  });
+
+  it('replaces a non-empty output directory with --force, removing stale files', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const outDir = path.join(dir, 'out-force');
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, 'stale.html'), '<html><body>OLD SECRET</body></html>');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--force']);
+    assert.equal(r.code, 0);
+    assert.ok(!fs.existsSync(path.join(outDir, 'stale.html')), 'stale file should be gone');
+    assert.ok(fs.existsSync(path.join(outDir, 'index.html')));
+    // No backup or staging directories left behind
+    const siblings = fs.readdirSync(dir).filter((f) => f.startsWith('out-force.veil-'));
+    assert.deepEqual(siblings, []);
+  });
+
+  it('writes into an existing empty output directory', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const outDir = path.join(dir, 'out-empty');
+    fs.mkdirSync(outDir, { recursive: true });
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    assert.ok(fs.existsSync(path.join(outDir, 'index.html')));
+  });
+
+  it('rejects an output path that is a symlink to another directory', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>SOURCE</body></html>' });
+    const alias = path.join(dir, 'out-alias');
+    fs.symlinkSync(siteDir, alias);
+    const r = run([siteDir, alias, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /symbolic link/);
+    // Source is intact
+    assert.match(fs.readFileSync(path.join(siteDir, 'index.html'), 'utf8'), /SOURCE/);
+    fs.unlinkSync(alias);
+  });
+
+  it('rejects symlinks inside the input directory with a path-specific error', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const target = path.join(dir, 'outside.css');
+    fs.writeFileSync(target, 'body{}');
+    fs.symlinkSync(target, path.join(siteDir, 'linked.css'));
+    const r = run([siteDir, path.join(dir, 'out-symlink-input'), '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /symbolic link in input directory: linked\.css/);
+    fs.unlinkSync(path.join(siteDir, 'linked.css'));
+  });
+
+  it('encrypts mixed-case HTML extensions', () => {
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><body>x</body></html>',
+      'SECRET.HTML': '<html><body>UPPER SECRET</body></html>',
+      'Report.HtM': '<html><body>MIXED SECRET</body></html>',
+    });
+    const outDir = path.join(dir, 'out-case');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    for (const name of ['SECRET.HTML', 'Report.HtM']) {
+      const content = fs.readFileSync(path.join(outDir, name), 'utf8');
+      assert.ok(!content.includes('SECRET'), `${name} must not contain plaintext`);
+      assert.match(content, /veil-payload/);
+    }
+  });
+
+  it('rejects an output that lexically contains a symlinked input path', () => {
+    // Input supplied through a symlink living inside the output directory:
+    // canonical comparison alone would call these separate trees, and --force
+    // replacement would then delete the symlink the input was named through.
+    const realSite = path.join(dir, 'real-site');
+    fs.mkdirSync(realSite, { recursive: true });
+    fs.writeFileSync(path.join(realSite, 'index.html'), '<html><body>REAL</body></html>');
+    const jobDir = path.join(dir, 'job');
+    fs.mkdirSync(jobDir, { recursive: true });
+    const linkedInput = path.join(jobDir, 'site');
+    fs.symlinkSync(realSite, linkedInput);
+    const r = run([linkedInput, jobDir, '--passphrase', 'test', '--iterations', '100000', '--force']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /cannot be the same as, inside, or contain/);
+    assert.ok(fs.lstatSync(linkedInput).isSymbolicLink(), 'input symlink must survive');
+    assert.match(fs.readFileSync(path.join(realSite, 'index.html'), 'utf8'), /REAL/);
+  });
+
+  // Deterministic fault injection: preload a module via NODE_OPTIONS that
+  // makes a chosen fs call throw inside the child process. Works regardless
+  // of uid/platform permission semantics.
+  function faultModule(name, code) {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, code);
+    return { ...process.env, NODE_OPTIONS: `--require ${file}` };
+  }
+
+  it('cleans up staging when a wrapper write fails mid-build', () => {
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><body>x</body></html>',
+      'boom.html': '<html><body>y</body></html>',
+    });
+    const env = faultModule('fault-write.js', `
+      const fs = require('fs');
+      const orig = fs.writeFileSync;
+      fs.writeFileSync = function (p, ...rest) {
+        if (String(p).endsWith('boom.html')) throw new Error('injected write failure');
+        return orig.call(fs, p, ...rest);
+      };
+    `);
+    const outDir = path.join(dir, 'out-midfail');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000'], { env });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /injected write failure/);
+    assert.ok(!fs.existsSync(outDir), 'failed build must not publish output');
+    const siblings = fs.readdirSync(dir).filter((f) => f.startsWith('out-midfail.veil-'));
+    assert.deepEqual(siblings, [], 'failed build must not leave staging dirs');
+  });
+
+  it('cleans up staging when the post-mkdtemp chmod fails', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const env = faultModule('fault-chmod.js', `
+      const fs = require('fs');
+      const orig = fs.chmodSync;
+      fs.chmodSync = function (p, ...rest) {
+        if (String(p).includes('.veil-tmp-')) throw new Error('injected chmod failure');
+        return orig.call(fs, p, ...rest);
+      };
+    `);
+    const outDir = path.join(dir, 'out-chmodfail');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000'], { env });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /injected chmod failure/);
+    assert.ok(!fs.existsSync(outDir), 'failed build must not publish output');
+    const siblings = fs.readdirSync(dir).filter((f) => f.startsWith('out-chmodfail.veil-'));
+    assert.deepEqual(siblings, [], 'chmod failure must not leak the staging dir');
+  });
+
+  it('published output directory has a umask-derived mode (POSIX)', (t) => {
+    if (process.platform === 'win32') return t.skip();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const outDir = path.join(dir, 'out-mode');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const mode = fs.statSync(outDir).mode & 0o777;
+    assert.equal(mode, 0o777 & ~process.umask());
+  });
+
+  it('a failed run creates no output directory', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const outDir = path.join(dir, 'out-failed');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '99999']);
+    assert.equal(r.code, 1);
+    assert.ok(!fs.existsSync(outDir), 'failed run must not create output');
+    const siblings = fs.readdirSync(dir).filter((f) => f.startsWith('out-failed.veil-'));
+    assert.deepEqual(siblings, [], 'failed run must not leave staging dirs');
   });
 });
 

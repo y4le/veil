@@ -24,7 +24,13 @@ Options:
   --remember            Check "Remember this device" by default
   --html-root <dir>     Encrypt only HTML under this input-relative dir (repeatable)
   --no-inline           Skip local CSS/JS inlining
+  --force               Replace a non-empty output directory
   --help                Show this help
+
+The output directory is built fresh on every run: Veil stages the build in a
+temporary sibling directory and moves it into place, so the output never mixes
+files from different builds. A non-empty output directory is only replaced
+with --force.
 `.trim();
   console.log(usage);
 }
@@ -40,6 +46,7 @@ function parseArgs(argv) {
     iterations: 600000,
     remember: false,
     inline: true,
+    force: false,
     htmlRoots: [],
   };
   const positional = [];
@@ -70,6 +77,8 @@ function parseArgs(argv) {
       opts.htmlRoots.push(normalizeHtmlRoot(root));
     } else if (arg === '--no-inline') {
       opts.inline = false;
+    } else if (arg === '--force') {
+      opts.force = true;
     } else if (arg.startsWith('-')) {
       fatal(`Unknown option: ${arg}`);
     } else {
@@ -536,19 +545,34 @@ function escapeJsonForScriptTag(str) {
 // File system helpers
 // ---------------------------------------------------------------------------
 
-/** Recursively collect all files under dir, returning paths relative to dir. */
-function walkDir(dir) {
+/** Case-insensitive HTML file classification, used everywhere HTML is decided. */
+function isHtmlFile(name) {
+  return /\.html?$/i.test(name);
+}
+
+/**
+ * Recursively collect all files under dir, returning paths relative to dir.
+ * Symlinks and special files are rejected: silently skipping them (the old
+ * behavior) made files vanish from builds, and following them would need
+ * cycle handling and escape checks. Rejecting is the simple, safe policy.
+ */
+function walkDir(dir, relBase = '') {
   const results = [];
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
-    const rel = entry.name;
-    const full = path.join(dir, rel);
-    if (entry.isDirectory()) {
-      for (const child of walkDir(full)) {
-        results.push(path.join(rel, child));
-      }
+    const full = path.join(dir, entry.name);
+    const rel = path.join(relBase, entry.name);
+    if (entry.isSymbolicLink()) {
+      fatal(
+        `symbolic link in input directory: ${rel}\n` +
+        'Veil does not follow symlinks. Replace it with a regular file or directory.'
+      );
+    } else if (entry.isDirectory()) {
+      results.push(...walkDir(full, rel));
     } else if (entry.isFile()) {
       results.push(rel);
+    } else {
+      fatal(`unsupported file type in input directory: ${rel}`);
     }
   }
   return results;
@@ -565,6 +589,104 @@ function copyFile(src, dest) {
   fs.copyFileSync(src, dest);
 }
 
+/**
+ * Canonicalize a path that may not exist yet: realpath of the nearest
+ * existing ancestor joined with the unresolved remainder.
+ */
+function canonicalizePath(p) {
+  let existing = path.resolve(p);
+  const suffix = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    suffix.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.join(fs.realpathSync(existing), ...suffix);
+}
+
+/**
+ * Refuse input/output layouts where writing the output could touch the input.
+ * Compares canonical (symlink-resolved) paths in both directions, so an
+ * output path that is an alias for the input — or contains it, or lives
+ * inside it — is rejected rather than silently overwriting source files.
+ */
+function assertSeparateTrees(inputDir, outputDir) {
+  let outLstat = null;
+  try { outLstat = fs.lstatSync(outputDir); } catch {}
+  if (outLstat && outLstat.isSymbolicLink()) {
+    fatal(`output directory must not be a symbolic link: ${outputDir}`);
+  }
+  if (outLstat && !outLstat.isDirectory()) {
+    fatal(`output path exists and is not a directory: ${outputDir}`);
+  }
+  const contains = (rel) =>
+    rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+  // Check both lexical and canonical (symlink-resolved) forms. Canonical
+  // comparison catches aliases; the lexical check additionally protects the
+  // path the input was supplied through — e.g. an input reached via a symlink
+  // that lives inside the output directory would survive canonical
+  // comparison, and --force replacement would then delete it.
+  const pairs = [
+    [path.resolve(inputDir), path.resolve(outputDir)],
+    [fs.realpathSync(inputDir), canonicalizePath(outputDir)],
+  ];
+  for (const [a, b] of pairs) {
+    if (contains(path.relative(a, b)) || contains(path.relative(b, a))) {
+      fatal('Output directory cannot be the same as, inside, or contain the input directory');
+    }
+  }
+}
+
+/**
+ * Move a fully built staging directory into place as the output directory.
+ *
+ * - destination absent: plain rename (the genuinely atomic case)
+ * - destination empty: remove it, then rename
+ * - destination non-empty: refuse unless force, then replace via
+ *   backup-rename with rollback. This is crash-recoverable, not atomic:
+ *   a reader can briefly observe a missing output during the swap.
+ *
+ * Throws (never exits) so the caller retains staging-cleanup ownership.
+ */
+function publishOutput(stagingDir, outputDir, force) {
+  let st = null;
+  try { st = fs.statSync(outputDir); } catch {}
+
+  if (st && !st.isDirectory()) {
+    throw new Error(`output path exists and is not a directory: ${outputDir}`);
+  }
+  if (!st) {
+    fs.renameSync(stagingDir, outputDir);
+    return;
+  }
+  if (fs.readdirSync(outputDir).length === 0) {
+    fs.rmdirSync(outputDir);
+    fs.renameSync(stagingDir, outputDir);
+    return;
+  }
+  if (!force) {
+    throw new Error(
+      `output directory is not empty: ${outputDir}\n` +
+      'Veil replaces the whole output directory so stale files from earlier\n' +
+      'builds can never be deployed. Re-run with --force to replace it.'
+    );
+  }
+  const backupDir = `${outputDir}.veil-old-${process.pid}-${Date.now()}`;
+  fs.renameSync(outputDir, backupDir);
+  try {
+    fs.renameSync(stagingDir, outputDir);
+  } catch (err) {
+    fs.renameSync(backupDir, outputDir); // roll the old output back
+    throw err;
+  }
+  try {
+    fs.rmSync(backupDir, { recursive: true, force: true });
+  } catch {
+    console.warn(`veil: warning: could not remove backup directory: ${backupDir}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -572,7 +694,8 @@ function copyFile(src, dest) {
 async function main() {
   const opts = parseArgs(process.argv);
 
-  // Validate input directory
+  // -- Validate everything before touching the filesystem ------------------
+
   if (!fs.existsSync(opts.inputDir)) {
     fatal(`Input directory does not exist: ${opts.inputDir}`);
   }
@@ -580,14 +703,27 @@ async function main() {
     fatal(`Not a directory: ${opts.inputDir}`);
   }
 
-  // Prevent output nested inside input (causes recursive traversal)
-  const resolvedIn = path.resolve(opts.inputDir) + path.sep;
-  const resolvedOut = path.resolve(opts.outputDir) + path.sep;
-  if (resolvedOut.startsWith(resolvedIn)) {
-    fatal('Output directory cannot be inside input directory');
+  assertSeparateTrees(opts.inputDir, opts.outputDir);
+
+  // Refuse a non-empty destination up front (publishOutput re-checks in case
+  // of races) so no work happens on a build that cannot be published.
+  if (
+    !opts.force &&
+    fs.existsSync(opts.outputDir) &&
+    fs.statSync(opts.outputDir).isDirectory() &&
+    fs.readdirSync(opts.outputDir).length > 0
+  ) {
+    fatal(
+      `output directory is not empty: ${opts.outputDir}\n` +
+      'Veil replaces the whole output directory so stale files from earlier\n' +
+      'builds can never be deployed. Re-run with --force to replace it.'
+    );
   }
 
-  // Prompt for passphrase if not provided
+  if (opts.iterations < MIN_ITERATIONS) {
+    fatal(`Iterations must be at least ${MIN_ITERATIONS} (got ${opts.iterations})`);
+  }
+
   if (opts.passphrase && opts.passphraseEnv) {
     fatal('Use only one of --passphrase or --passphrase-env');
   }
@@ -608,7 +744,7 @@ async function main() {
 
   // Discover files
   const files = walkDir(opts.inputDir);
-  const allHtmlFiles = files.filter((f) => f.endsWith('.html') || f.endsWith('.htm'));
+  const allHtmlFiles = files.filter(isHtmlFile);
   const htmlFiles = allHtmlFiles.filter((f) => shouldEncryptHtml(f, opts.htmlRoots));
   const htmlFileSet = new Set(htmlFiles);
   const passthroughFiles = files.filter((f) => !htmlFileSet.has(f));
@@ -617,17 +753,17 @@ async function main() {
     fatal('No HTML files found in input directory');
   }
   if (htmlFiles.length === 0) {
-    if (opts.htmlRoots.length > 0) {
-      fatal(`No HTML files matched --html-root (${opts.htmlRoots.join(', ')})`);
-    }
-    fatal('No HTML files found in input directory');
+    fatal(`No HTML files matched --html-root (${opts.htmlRoots.join(', ')})`);
   }
 
-  // Ensure output directory
-  ensureDir(opts.outputDir);
+  // Generate site-wide cryptographic material (also before any writes)
+  const siteKeys = generateSiteKeys(opts.passphrase, opts.iterations, opts.siteId);
+  const payloadMeta = buildPayloadMeta(siteKeys, opts.siteId, opts.remember);
 
-  const publicHtmlFiles = passthroughFiles.filter((f) => f.endsWith('.html') || f.endsWith('.htm'));
-  const publicOtherFiles = passthroughFiles.filter((f) => !f.endsWith('.html') && !f.endsWith('.htm'));
+  // -- Build into a staging directory, publish only on success -------------
+
+  const publicHtmlFiles = passthroughFiles.filter(isHtmlFile);
+  const publicOtherFiles = passthroughFiles.filter((f) => !isHtmlFile(f));
 
   if (publicOtherFiles.length > 0) {
     console.warn(`veil: copying ${publicOtherFiles.length} non-HTML file(s) unencrypted — these remain public`);
@@ -635,46 +771,61 @@ async function main() {
   if (publicHtmlFiles.length > 0) {
     console.warn(`veil: leaving ${publicHtmlFiles.length} HTML file(s) public outside the encrypted roots`);
   }
-  for (const file of passthroughFiles) {
-    copyFile(
-      path.join(opts.inputDir, file),
-      path.join(opts.outputDir, file)
-    );
-  }
 
-  // Generate site-wide cryptographic material
-  const siteKeys = generateSiteKeys(opts.passphrase, opts.iterations, opts.siteId);
-  const payloadMeta = buildPayloadMeta(siteKeys, opts.siteId, opts.remember);
+  ensureDir(path.dirname(opts.outputDir));
+  const stagingDir = fs.mkdtempSync(`${opts.outputDir}.veil-tmp-`);
 
-  // Process HTML files: inline assets, encrypt, generate wrapper
-  for (const file of htmlFiles) {
-    const src = path.join(opts.inputDir, file);
-    let html = fs.readFileSync(src, 'utf8');
+  let published = false;
+  try {
+    // mkdtemp creates 0700; published output should have a normal
+    // umask-derived directory mode so other users (e.g. a web server) can
+    // traverse it.
+    fs.chmodSync(stagingDir, 0o777 & ~process.umask());
 
-    if (opts.inline) {
-      html = inlineAssets(html, path.dirname(src), opts.inputDir);
+    for (const file of passthroughFiles) {
+      copyFile(
+        path.join(opts.inputDir, file),
+        path.join(stagingDir, file)
+      );
     }
 
-    // Extract page title for the wrapper
-    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    const pageTitle = titleMatch ? titleMatch[1].trim() : 'Protected Page';
+    // Process HTML files: inline assets, encrypt, generate wrapper
+    for (const file of htmlFiles) {
+      const src = path.join(opts.inputDir, file);
+      let html = fs.readFileSync(src, 'utf8');
 
-    // Encrypt the page
-    const { ciphertext, iv } = encryptPage(html, siteKeys.mk, opts.siteId);
+      if (opts.inline) {
+        html = inlineAssets(html, path.dirname(src), opts.inputDir);
+      }
 
-    // Build per-page data
-    const pageData = {
-      ...payloadMeta,
-      title: pageTitle,
-      ct: ciphertext.toString('base64'),
-      iv: iv.toString('base64'),
-    };
+      // Extract page title for the wrapper
+      const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      const pageTitle = titleMatch ? titleMatch[1].trim() : 'Protected Page';
 
-    // Generate self-contained wrapper HTML
-    const wrapper = generateWrapper(pageData);
-    const dest = path.join(opts.outputDir, file);
-    ensureDir(path.dirname(dest));
-    fs.writeFileSync(dest, wrapper);
+      // Encrypt the page
+      const { ciphertext, iv } = encryptPage(html, siteKeys.mk, opts.siteId);
+
+      // Build per-page data
+      const pageData = {
+        ...payloadMeta,
+        title: pageTitle,
+        ct: ciphertext.toString('base64'),
+        iv: iv.toString('base64'),
+      };
+
+      // Generate self-contained wrapper HTML
+      const wrapper = generateWrapper(pageData);
+      const dest = path.join(stagingDir, file);
+      ensureDir(path.dirname(dest));
+      fs.writeFileSync(dest, wrapper);
+    }
+
+    publishOutput(stagingDir, opts.outputDir, opts.force);
+    published = true;
+  } finally {
+    if (!published) {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    }
   }
 
   console.log(
