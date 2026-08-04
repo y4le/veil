@@ -5,8 +5,9 @@ const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+// Tests decrypt with the real implementation, not a copy of it.
+const { extractPayload, decryptPayload } = require('./veil.js');
 
 const VEIL = path.join(__dirname, 'veil.js');
 
@@ -1264,36 +1265,27 @@ describe('wrapper HTML', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Helpers for decryption in tests
+// Module export tests
 // ---------------------------------------------------------------------------
 
-function extractPayload(wrapperHtml) {
-  const match = wrapperHtml.match(/<script id="veil-payload" type="application\/json">([^<]+)<\/script>/);
-  if (!match) throw new Error('Could not find veil-payload in wrapper HTML');
-  return JSON.parse(match[1]);
-}
+describe('module exports', () => {
+  it('requiring veil.js does not run the CLI', () => {
+    const r = spawnSync(
+      process.execPath,
+      ['-e', `require(${JSON.stringify(VEIL)}); console.log('ok')`],
+      { encoding: 'utf8', timeout: 30000 }
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /^ok$/m);
+    assert.doesNotMatch(r.stdout, /Usage: veil/);
+    assert.equal(r.stderr, '');
+  });
 
-function decryptPayload(payload, passphrase) {
-  const salt = Buffer.from(payload.salt, 'base64');
-  const aad = Buffer.from(`veil:v${payload.v}:${payload.siteId}`);
-
-  // Derive KEK
-  const kek = crypto.pbkdf2Sync(passphrase, salt, payload.iterations, 32, 'sha256');
-
-  // Unwrap MK
-  const wrapIv = Buffer.from(payload.wrapIv, 'base64');
-  const wrapped = Buffer.from(payload.wrappedMk, 'base64');
-  const decipher1 = crypto.createDecipheriv('aes-256-gcm', kek, wrapIv);
-  decipher1.setAAD(aad);
-  decipher1.setAuthTag(wrapped.subarray(32));
-  const mk = Buffer.concat([decipher1.update(wrapped.subarray(0, 32)), decipher1.final()]);
-
-  // Decrypt page
-  const iv = Buffer.from(payload.iv, 'base64');
-  const ct = Buffer.from(payload.ct, 'base64');
-  const decipher2 = crypto.createDecipheriv('aes-256-gcm', mk, iv);
-  decipher2.setAAD(aad);
-  decipher2.setAuthTag(ct.subarray(ct.length - 16));
-  const plaintext = Buffer.concat([decipher2.update(ct.subarray(0, ct.length - 16)), decipher2.final()]);
-  return plaintext.toString('utf8');
-}
+  it('extractPayload returns null for HTML that carries no valid payload', () => {
+    assert.equal(extractPayload('<html><body>not a wrapper</body></html>'), null);
+    assert.equal(
+      extractPayload('<script id="veil-payload" type="application/json">{oops</script>'),
+      null
+    );
+  });
+});

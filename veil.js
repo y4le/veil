@@ -824,9 +824,14 @@ function collectLocalRefs(html, pageRelPath, inputRoot) {
 const FORMAT_VERSION = 1;
 const MIN_ITERATIONS = 100000;
 
-/** Build the AAD string that binds metadata to authenticated ciphertext. */
-function buildAad(siteId) {
-  return Buffer.from(`veil:v${FORMAT_VERSION}:${siteId}`);
+/**
+ * Build the AAD string that binds metadata to authenticated ciphertext.
+ * The format version is an explicit argument, not the constant: encryption
+ * passes FORMAT_VERSION, while decryption passes the version the payload
+ * itself declares, so an older payload still authenticates under its own AAD.
+ */
+function buildAad(version, siteId) {
+  return Buffer.from(`veil:v${version}:${siteId}`);
 }
 
 /**
@@ -839,8 +844,10 @@ function buildAad(siteId) {
  * @returns {{ salt: Buffer, iterations: number, wrappedMk: Buffer, wrapIv: Buffer, mk: Buffer }}
  */
 function generateSiteKeys(passphrase, iterations, siteId) {
+  // main() rejects a low iteration count before any work starts; this is the
+  // library-level guard for callers that did not.
   if (iterations < MIN_ITERATIONS) {
-    fatal(`Iterations must be at least ${MIN_ITERATIONS} (got ${iterations})`);
+    throw new Error(`Iterations must be at least ${MIN_ITERATIONS} (got ${iterations})`);
   }
 
   // Random site master key (256-bit)
@@ -853,7 +860,7 @@ function generateSiteKeys(passphrase, iterations, siteId) {
   const kek = crypto.pbkdf2Sync(passphrase, salt, iterations, 32, 'sha256');
 
   // Wrap MK with AES-256-GCM using KEK, with AAD
-  const aad = buildAad(siteId);
+  const aad = buildAad(FORMAT_VERSION, siteId);
   const wrapIv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', kek, wrapIv);
   cipher.setAAD(aad);
@@ -873,7 +880,7 @@ function generateSiteKeys(passphrase, iterations, siteId) {
  * @returns {{ ciphertext: Buffer, iv: Buffer }}
  */
 function encryptPage(html, mk, siteId) {
-  const aad = buildAad(siteId);
+  const aad = buildAad(FORMAT_VERSION, siteId);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', mk, iv);
   cipher.setAAD(aad);
@@ -902,6 +909,42 @@ function buildPayloadMeta(siteKeys, siteId, remember) {
     wrapIv: siteKeys.wrapIv.toString('base64'),
     remember,
   };
+}
+
+/**
+ * Decrypt a wrapper payload the way the browser runtime does: derive the KEK
+ * from the passphrase, unwrap the master key, then decrypt the page.
+ *
+ * The AAD comes from the payload's own version and site id, so a payload
+ * written by an older format still verifies under the AAD it was sealed with.
+ * Throws on any authentication or decoding failure — a wrong passphrase, a
+ * tampered field, and a corrupt ciphertext are all meaningful signals.
+ *
+ * @param {object} payload - The parsed veil-payload object from a wrapper
+ * @param {string} passphrase
+ * @returns {string} The decrypted page HTML
+ */
+function decryptPayload(payload, passphrase) {
+  const aad = buildAad(payload.v, payload.siteId);
+  const salt = Buffer.from(payload.salt, 'base64');
+
+  // Derive the KEK from the passphrase
+  const kek = crypto.pbkdf2Sync(passphrase, salt, payload.iterations, 32, 'sha256');
+
+  // Unwrap the master key (32-byte key followed by its 16-byte auth tag)
+  const wrapped = Buffer.from(payload.wrappedMk, 'base64');
+  const unwrap = crypto.createDecipheriv('aes-256-gcm', kek, Buffer.from(payload.wrapIv, 'base64'));
+  unwrap.setAAD(aad);
+  unwrap.setAuthTag(wrapped.subarray(32));
+  const mk = Buffer.concat([unwrap.update(wrapped.subarray(0, 32)), unwrap.final()]);
+
+  // Decrypt the page with the master key
+  const ct = Buffer.from(payload.ct, 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', mk, Buffer.from(payload.iv, 'base64'));
+  decipher.setAAD(aad);
+  decipher.setAuthTag(ct.subarray(ct.length - 16));
+  const plaintext = Buffer.concat([decipher.update(ct.subarray(0, ct.length - 16)), decipher.final()]);
+  return plaintext.toString('utf8');
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1187,29 @@ function escapeJsonForScriptTag(str) {
     .replace(/&/g, '\\u0026')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
+}
+
+/** The payload script emitted by generateWrapper; its body never contains '<'. */
+const PAYLOAD_RE = /<script id="veil-payload" type="application\/json">([^<]+)<\/script>/;
+
+/**
+ * Read the metadata payload back out of a wrapper page.
+ *
+ * Returns null when the page carries no payload script or its contents are not
+ * JSON — both mean "this is not a Veil wrapper", which callers must be able to
+ * tell apart from a decryption failure, so neither case throws.
+ *
+ * @param {string} wrapperHtml - A generated wrapper page
+ * @returns {object|null} The parsed payload, or null
+ */
+function extractPayload(wrapperHtml) {
+  const match = PAYLOAD_RE.exec(wrapperHtml);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1610,38 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  fatal(err && err.message ? err.message : String(err));
-});
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
+// The pure, crypto, and payload surface — everything that can be exercised
+// without a filesystem build. Nothing exported here calls fatal() or exits:
+// library callers get thrown errors, so only the CLI decides to terminate.
+module.exports = {
+  FORMAT_VERSION,
+  MIN_ITERATIONS,
+  buildAad,
+  generateSiteKeys,
+  encryptPage,
+  buildPayloadMeta,
+  generateWrapper,
+  extractPayload,
+  decryptPayload,
+  isHtmlFile,
+  escapeHtml,
+  escapeJsonForScriptTag,
+  inlineAssets,
+  rewriteCssUrls,
+  cssUnescape,
+  scanTags,
+  findAttr,
+  getAttr,
+};
+
+// Only run the CLI when invoked as a program: requiring this file must not
+// build anything.
+if (require.main === module) {
+  main().catch((err) => {
+    fatal(err && err.message ? err.message : String(err));
+  });
+}
