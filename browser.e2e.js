@@ -71,7 +71,7 @@ function build(inputFiles, outDir, extraArgs = []) {
 
 describe('wrapper runtime (browser)', () => {
   let browser, server, root, baseUrl;
-  const SK = 'veil:v1:e2e:mk';
+  const SK = 'veil:v2:e2e:mk';
 
   before(async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'veil-e2e-www-'));

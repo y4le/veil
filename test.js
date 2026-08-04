@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 // Tests decrypt with the real implementation, not a copy of it.
-const { extractPayload, decryptPayload } = require('./veil.js');
+const { extractPayload, decryptPayload, validatePayload } = require('./veil.js');
 
 const VEIL = path.join(__dirname, 'veil.js');
 
@@ -231,9 +231,9 @@ describe('output artifact safety', () => {
     const outDir = path.join(dir, 'out-case');
     const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
     assert.equal(r.code, 0);
-    for (const name of ['SECRET.HTML', 'Report.HtM']) {
+    for (const [name, marker] of [['SECRET.HTML', 'UPPER SECRET'], ['Report.HtM', 'MIXED SECRET']]) {
       const content = fs.readFileSync(path.join(outDir, name), 'utf8');
-      assert.ok(!content.includes('SECRET'), `${name} must not contain plaintext`);
+      assert.ok(!content.includes(marker), `${name} must not contain plaintext`);
       assert.match(content, /veil-payload/);
     }
   });
@@ -1066,10 +1066,12 @@ describe('encryption', () => {
     const outDir = path.join(dir, 'out-meta');
     run([siteDir, outDir, '--passphrase', 'test', '--iterations', '200000', '--id', 'my-site']);
     const payload = extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8'));
-    assert.equal(payload.v, 1);
+    assert.equal(payload.v, 2);
     assert.equal(payload.siteId, 'my-site');
     assert.equal(payload.iterations, 200000);
     assert.equal(payload.remember, false);
+    assert.equal(payload.path, 'index.html');
+    assert.ok(!('title' in payload), 'v2 payloads have no title field');
   });
 
   it('respects --remember flag', () => {
@@ -1136,6 +1138,92 @@ describe('encryption', () => {
     const payload = extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8'));
     payload.v = 99;
     assert.throws(() => decryptPayload(payload, 'test'));
+  });
+
+  it('rejects ct/iv swapped between pages of the same site (path binding)', () => {
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><body>page one</body></html>',
+      'about.html': '<html><body>page two</body></html>',
+    });
+    const outDir = path.join(dir, 'out-swap');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const p1 = extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8'));
+    const p2 = extractPayload(fs.readFileSync(path.join(outDir, 'about.html'), 'utf8'));
+    // Moving another page's ciphertext+IV into this payload must fail: the
+    // page AAD binds the ciphertext to its own output path.
+    const swapped = { ...p1, ct: p2.ct, iv: p2.iv };
+    assert.throws(() => decryptPayload(swapped, 'test'));
+    // Boundary (documented): copying the whole authenticated tuple
+    // {path, ct, iv} reproduces the other page's sealed identity and
+    // decrypts — indistinguishable from copying the whole file. AEAD does
+    // not prevent whole-artifact substitution or rollback.
+    const tupleCopy = { ...p1, path: p2.path, ct: p2.ct, iv: p2.iv };
+    assert.match(decryptPayload(tupleCopy, 'test'), /page two/);
+  });
+
+  it('validatePayload accepts a real payload and rejects field corruption', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const outDir = path.join(dir, 'out-validate');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const payload = extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8'));
+    assert.deepEqual(validatePayload(payload), []);
+
+    const cases = [
+      [{ v: 0 }, /v must be/],
+      [{ siteId: '' }, /siteId/],
+      [{ path: '' }, /path/],
+      [{ iterations: 99999 }, /iterations/],
+      [{ iterations: 100000.5 }, /iterations/],
+      [{ remember: 'yes' }, /remember/],
+      [{ salt: Buffer.alloc(8).toString('base64') }, /salt must be 16 bytes/],
+      [{ wrapIv: Buffer.alloc(11).toString('base64') }, /wrapIv/],
+      [{ wrappedMk: Buffer.alloc(47).toString('base64') }, /wrappedMk/],
+      [{ iv: 'AAAA AAAA' }, /iv is not canonical base64/],
+      [{ ct: Buffer.alloc(15).toString('base64') }, /ct must be at least 16 bytes/],
+      [{ ct: 42 }, /ct must be a base64 string/],
+    ];
+    for (const [patch, re] of cases) {
+      const errors = validatePayload({ ...payload, ...patch });
+      assert.ok(errors.some((e) => re.test(e)), `expected ${re} in ${JSON.stringify(errors)}`);
+    }
+    assert.throws(() => decryptPayload({ ...payload, salt: 'short' }, 'test'), /invalid payload/);
+  });
+
+  it('decrypts v1 payloads under their legacy AAD', () => {
+    // Hand-build a v1 payload the way the v1 tool did: one colon-delimited
+    // AAD shared by the wrap and page domains, title field present, no path.
+    const nodeCrypto = require('crypto');
+    const aad = Buffer.from('veil:v1:legacy-site');
+    const mk = nodeCrypto.randomBytes(32);
+    const salt = nodeCrypto.randomBytes(16);
+    const kek = nodeCrypto.pbkdf2Sync('legacy-pass', salt, 100000, 32, 'sha256');
+    const wrapIv = nodeCrypto.randomBytes(12);
+    const wrapC = nodeCrypto.createCipheriv('aes-256-gcm', kek, wrapIv);
+    wrapC.setAAD(aad);
+    const wrappedMk = Buffer.concat([wrapC.update(mk), wrapC.final(), wrapC.getAuthTag()]);
+    const iv = nodeCrypto.randomBytes(12);
+    const pageC = nodeCrypto.createCipheriv('aes-256-gcm', mk, iv);
+    pageC.setAAD(aad);
+    const ct = Buffer.concat([pageC.update('<html><body>legacy</body></html>', 'utf8'), pageC.final(), pageC.getAuthTag()]);
+    const payload = {
+      v: 1,
+      siteId: 'legacy-site',
+      salt: salt.toString('base64'),
+      iterations: 100000,
+      wrappedMk: wrappedMk.toString('base64'),
+      wrapIv: wrapIv.toString('base64'),
+      remember: false,
+      title: 'Old Title',
+      ct: ct.toString('base64'),
+      iv: iv.toString('base64'),
+    };
+    assert.match(decryptPayload(payload, 'legacy-pass'), /legacy/);
+    // Reading old payloads is Node-API back-compat only: the generated
+    // wrapper runtime always builds current-format AADs, so rewrapping a
+    // legacy payload must be refused rather than emitting a page that can
+    // never unlock.
+    const { generateWrapper } = require('./veil.js');
+    assert.throws(() => generateWrapper(payload), /only supports format v2/);
   });
 
   it('encrypts multiple pages with same MK', () => {
@@ -1211,7 +1299,7 @@ describe('wrapper HTML', () => {
     const match = wrapper.match(/<script id="veil-payload" type="application\/json">([^<]+)<\/script>/);
     assert.ok(match);
     assert.doesNotMatch(match[1], /&quot;|&lt;|&gt;|&amp;/);
-    assert.equal(JSON.parse(match[1]).title, 'Protected page');
+    assert.equal(JSON.parse(match[1]).path, 'index.html');
   });
 
   it('copies non-HTML files', () => {

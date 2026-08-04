@@ -821,17 +821,34 @@ function collectLocalRefs(html, pageRelPath, inputRoot) {
 // Encryption
 // ---------------------------------------------------------------------------
 
-const FORMAT_VERSION = 1;
+const FORMAT_VERSION = 2;
 const MIN_ITERATIONS = 100000;
 
 /**
- * Build the AAD string that binds metadata to authenticated ciphertext.
- * The format version is an explicit argument, not the constant: encryption
- * passes FORMAT_VERSION, while decryption passes the version the payload
- * itself declares, so an older payload still authenticates under its own AAD.
+ * Build the AAD that binds metadata to authenticated ciphertext.
+ *
+ * v2 encodes a JSON array — unambiguous even when siteId or path contain
+ * delimiters, and JSON.stringify produces identical bytes in Node and the
+ * browser for these value types. Two domains are separated: 'wrap' seals
+ * the master key, 'page' seals a page and binds it to its output-relative
+ * path, so a ct/iv pair moved to another page's payload fails to
+ * authenticate. (Copying the whole {path, ct, iv} tuple — or the whole
+ * file — is indistinguishable from the original and out of scope, as is
+ * rollback; see the threat model.)
+ *
+ * The version is an explicit argument, not the constant: encryption passes
+ * FORMAT_VERSION, decryption passes the version the payload declares, so
+ * older payloads authenticate under the AAD they were sealed with (v1 used
+ * one colon-delimited string for both domains).
  */
-function buildAad(version, siteId) {
-  return Buffer.from(`veil:v${version}:${siteId}`);
+function buildAad(version, siteId, purpose, pagePath) {
+  if (version < 2) {
+    return Buffer.from(`veil:v${version}:${siteId}`);
+  }
+  const parts = purpose === 'page'
+    ? ['veil', version, siteId, 'page', pagePath]
+    : ['veil', version, siteId, 'wrap'];
+  return Buffer.from(JSON.stringify(parts));
 }
 
 /**
@@ -860,7 +877,7 @@ function generateSiteKeys(passphrase, iterations, siteId) {
   const kek = crypto.pbkdf2Sync(passphrase, salt, iterations, 32, 'sha256');
 
   // Wrap MK with AES-256-GCM using KEK, with AAD
-  const aad = buildAad(FORMAT_VERSION, siteId);
+  const aad = buildAad(FORMAT_VERSION, siteId, 'wrap');
   const wrapIv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', kek, wrapIv);
   cipher.setAAD(aad);
@@ -877,10 +894,11 @@ function generateSiteKeys(passphrase, iterations, siteId) {
  * @param {string} html - The plaintext HTML content
  * @param {Buffer} mk - The site master key
  * @param {string} siteId - Used in AAD
+ * @param {string} pagePath - Output-relative posix path, bound into the AAD
  * @returns {{ ciphertext: Buffer, iv: Buffer }}
  */
-function encryptPage(html, mk, siteId) {
-  const aad = buildAad(FORMAT_VERSION, siteId);
+function encryptPage(html, mk, siteId, pagePath) {
+  const aad = buildAad(FORMAT_VERSION, siteId, 'page', pagePath);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', mk, iv);
   cipher.setAAD(aad);
@@ -912,20 +930,73 @@ function buildPayloadMeta(siteKeys, siteId, remember) {
 }
 
 /**
+ * Validate a wrapper payload's schema. Returns an array of error strings;
+ * empty means valid. Field lengths are exact byte counts after strict
+ * (canonical) base64 decoding, so a payload that merely decodes leniently
+ * is rejected.
+ */
+function validatePayload(payload) {
+  if (!payload || typeof payload !== 'object') return ['payload is not an object'];
+  const errors = [];
+  if (!Number.isInteger(payload.v) || payload.v < 1) {
+    errors.push('v must be a positive integer');
+  }
+  if (typeof payload.siteId !== 'string' || payload.siteId === '') {
+    errors.push('siteId must be a non-empty string');
+  }
+  if (Number.isInteger(payload.v) && payload.v >= 2 && (typeof payload.path !== 'string' || payload.path === '')) {
+    errors.push('path must be a non-empty string');
+  }
+  if (!Number.isInteger(payload.iterations) || payload.iterations < MIN_ITERATIONS) {
+    errors.push(`iterations must be an integer of at least ${MIN_ITERATIONS}`);
+  }
+  if (typeof payload.remember !== 'boolean') {
+    errors.push('remember must be a boolean');
+  }
+  const b64Field = (field, lengthOk, expected) => {
+    const s = payload[field];
+    if (typeof s !== 'string') {
+      errors.push(`${field} must be a base64 string`);
+      return;
+    }
+    const buf = Buffer.from(s, 'base64');
+    if (buf.toString('base64') !== s) {
+      errors.push(`${field} is not canonical base64`);
+      return;
+    }
+    if (!lengthOk(buf.length)) {
+      errors.push(`${field} must be ${expected} (got ${buf.length} bytes)`);
+    }
+  };
+  b64Field('salt', (n) => n === 16, '16 bytes');
+  b64Field('wrapIv', (n) => n === 12, '12 bytes');
+  b64Field('wrappedMk', (n) => n === 48, '48 bytes');
+  b64Field('iv', (n) => n === 12, '12 bytes');
+  b64Field('ct', (n) => n >= 16, 'at least 16 bytes');
+  return errors;
+}
+
+/**
  * Decrypt a wrapper payload the way the browser runtime does: derive the KEK
  * from the passphrase, unwrap the master key, then decrypt the page.
  *
- * The AAD comes from the payload's own version and site id, so a payload
- * written by an older format still verifies under the AAD it was sealed with.
- * Throws on any authentication or decoding failure — a wrong passphrase, a
- * tampered field, and a corrupt ciphertext are all meaningful signals.
+ * The AAD comes from the payload's own version, site id, and page path, so a
+ * payload written by an older format still verifies under the AAD it was
+ * sealed with. Throws on any validation, authentication, or decoding
+ * failure — a wrong passphrase, a tampered field, and a corrupt ciphertext
+ * are all meaningful signals.
  *
  * @param {object} payload - The parsed veil-payload object from a wrapper
  * @param {string} passphrase
  * @returns {string} The decrypted page HTML
  */
 function decryptPayload(payload, passphrase) {
-  const aad = buildAad(payload.v, payload.siteId);
+  const errors = validatePayload(payload);
+  if (errors.length > 0) {
+    throw new Error(`invalid payload: ${errors.join('; ')}`);
+  }
+  const wrapAad = buildAad(payload.v, payload.siteId, 'wrap');
+  const pageAad = buildAad(payload.v, payload.siteId, 'page', payload.path);
   const salt = Buffer.from(payload.salt, 'base64');
 
   // Derive the KEK from the passphrase
@@ -934,14 +1005,14 @@ function decryptPayload(payload, passphrase) {
   // Unwrap the master key (32-byte key followed by its 16-byte auth tag)
   const wrapped = Buffer.from(payload.wrappedMk, 'base64');
   const unwrap = crypto.createDecipheriv('aes-256-gcm', kek, Buffer.from(payload.wrapIv, 'base64'));
-  unwrap.setAAD(aad);
+  unwrap.setAAD(wrapAad);
   unwrap.setAuthTag(wrapped.subarray(32));
   const mk = Buffer.concat([unwrap.update(wrapped.subarray(0, 32)), unwrap.final()]);
 
   // Decrypt the page with the master key
   const ct = Buffer.from(payload.ct, 'base64');
   const decipher = crypto.createDecipheriv('aes-256-gcm', mk, Buffer.from(payload.iv, 'base64'));
-  decipher.setAAD(aad);
+  decipher.setAAD(pageAad);
   decipher.setAuthTag(ct.subarray(ct.length - 16));
   const plaintext = Buffer.concat([decipher.update(ct.subarray(0, ct.length - 16)), decipher.final()]);
   return plaintext.toString('utf8');
@@ -954,10 +1025,21 @@ function decryptPayload(payload, passphrase) {
 /**
  * Generate a self-contained HTML wrapper page that decrypts and displays content.
  *
+ * Only the current format is supported: the emitted runtime constructs
+ * current-format AADs, so wrapping an older payload would produce a page
+ * that can never unlock. Reading old payloads is a Node-API concern
+ * (decryptPayload dispatches on payload.v); generating wrappers is not.
+ *
  * @param {object} pageData - The encrypted payload and metadata
  * @returns {string} Complete HTML wrapper page
  */
 function generateWrapper(pageData) {
+  if (pageData.v !== FORMAT_VERSION) {
+    throw new Error(
+      `generateWrapper only supports format v${FORMAT_VERSION} payloads (got v${pageData.v}); ` +
+      're-encrypt the source content instead of rewrapping an old payload'
+    );
+  }
   const jsonPayload = JSON.stringify(pageData);
 
   return `<!DOCTYPE html>
@@ -967,7 +1049,7 @@ function generateWrapper(pageData) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' 'self'; img-src 'self' data:; font-src 'self' data:; media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'self'">
 <meta name="robots" content="noindex,nofollow,noarchive">
-<title>${escapeHtml(pageData.title)}</title>
+<title>Protected page</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
@@ -1004,7 +1086,8 @@ var D=document,W=window;
 var S=(W.crypto&&W.crypto.subtle)||null;
 var data=JSON.parse(D.getElementById('veil-payload').textContent);
 var SK='veil:v'+data.v+':'+data.siteId+':mk';
-var aadStr='veil:v'+data.v+':'+data.siteId;
+var wrapAad=JSON.stringify(['veil',data.v,data.siteId,'wrap']);
+var pageAad=JSON.stringify(['veil',data.v,data.siteId,'page',data.path]);
 
 function b64(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)})}
 function toAb(u){return u.buffer.slice(u.byteOffset,u.byteOffset+u.byteLength)}
@@ -1039,7 +1122,7 @@ return S.importKey('raw',raw,{name:'AES-GCM'},false,['decrypt']);
 
 function decryptPage(mkKey){
 var ct=b64(data.ct),iv=b64(data.iv);
-var aad=new TextEncoder().encode(aadStr);
+var aad=new TextEncoder().encode(pageAad);
 return S.decrypt({name:'AES-GCM',iv:toAb(iv),additionalData:toAb(aad),tagLength:128},mkKey,toAb(ct));
 }
 
@@ -1076,7 +1159,7 @@ W.location.reload();
 
 function deriveAndUnwrap(passphrase){
 var salt=b64(data.salt);
-var aad=new TextEncoder().encode(aadStr);
+var aad=new TextEncoder().encode(wrapAad);
 return S.importKey('raw',new TextEncoder().encode(passphrase),'PBKDF2',false,['deriveKey'])
 .then(function(baseKey){
 return S.deriveKey(
@@ -1476,16 +1559,13 @@ async function main() {
         inlineWarnings.push(...scanBlockedScripts(html, file));
       }
 
-      // Encrypt the page
-      const { ciphertext, iv } = encryptPage(html, siteKeys.mk, opts.siteId);
+      // Encrypt the page, binding it to its output-relative posix path
+      const pagePath = file.split(path.sep).join('/');
+      const { ciphertext, iv } = encryptPage(html, siteKeys.mk, opts.siteId, pagePath);
 
-      // Build per-page data. The wrapper title is a constant: the real
-      // page title is content and must not appear in the public wrapper
-      // (document.write restores it after decryption). The payload field
-      // stays until the v2 format removes it from the schema.
       const pageData = {
         ...payloadMeta,
-        title: 'Protected page',
+        path: pagePath,
         ct: ciphertext.toString('base64'),
         iv: iv.toString('base64'),
       };
@@ -1624,6 +1704,7 @@ module.exports = {
   generateSiteKeys,
   encryptPage,
   buildPayloadMeta,
+  validatePayload,
   generateWrapper,
   extractPayload,
   decryptPayload,

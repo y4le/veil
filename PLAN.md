@@ -176,7 +176,8 @@ passphrase
 | Page IV | 12 random bytes per file | Never reused with same key |
 | Wrap IV | 12 random bytes per build | Used to wrap `MK` |
 | MK size | 32 bytes | Random 256-bit site key |
-| Format version | integer | Allows forward-compatible wrapper changes |
+| Format version | integer (`2`) | Allows forward-compatible wrapper changes |
+| AAD | `JSON.stringify(['veil', v, siteId, 'wrap'])` / `(['veil', v, siteId, 'page', path])` | Domain-separated; pages are bound to their output-relative path, so a ct/IV pair moved to another page's payload fails to authenticate. Whole-tuple/whole-file substitution and rollback remain out of scope. |
 
 ### Iteration strategy
 
@@ -212,8 +213,8 @@ Storage keys must be site-scoped because project sites under `username.github.io
 Recommended keys:
 
 ```text
-veil:v1:<site-id>:mk
-veil:v1:<site-id>:meta
+veil:v2:<site-id>:mk
+veil:v2:<site-id>:meta
 ```
 
 `<site-id>` defaults to the output directory basename, with a CLI flag to override it explicitly.
