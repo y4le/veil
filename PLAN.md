@@ -35,21 +35,26 @@ Veil’s value is a cleaner opinionated middle ground:
 ### Implemented now
 
 - `veil.js` is a working single-file Node CLI with no runtime dependencies.
-- Veil encrypts directories of HTML files and copies non-HTML assets through unchanged.
-- Local CSS and JS are inlined by default so protected HTML wrappers can stand on their own.
+- Veil encrypts directories of HTML files and copies non-HTML assets through, minus the assets it can prove are unreachable (see Asset Strategy).
+- Local CSS and JS are inlined by default so protected HTML wrappers can stand on their own. Encrypted HTML and inlined assets must be valid UTF-8; anything else fails the build rather than being silently mangled.
 - The crypto model uses site-level envelope encryption: a random site master key `MK`, a passphrase-derived `KEK`, and `AES-256-GCM` for both wrapping and page encryption.
-- The runtime wrapper supports prompt-based unlock, shared site-wide unlock state, `sessionStorage` by default, optional persistent remember-device behavior, a lock button, and `?veil=logout`.
-- The CLI already supports `--passphrase-env`, `--id`, `--iterations`, `--remember`, `--html-root`, and `--no-inline`.
-- A test suite exists, including regression coverage for wrapper payload encoding.
+- Format v2: JSON-array AADs with separate `wrap`/`page` domains, and each page bound to its output-relative path (also carried as the payload's `path` field).
+- The output directory is a fresh artifact. Veil builds into a temporary sibling directory and moves it into place on success; a non-empty destination is refused unless `--force` is passed, and symlinks inside the input tree are rejected outright.
+- The runtime wrapper supports prompt-based unlock, shared site-wide unlock state, `sessionStorage` by default, optional persistent remember-device behavior, a lock button, and `?veil=logout`. It reports a clear error instead of hanging when Web Crypto is unavailable (non-secure context).
+- Public wrappers carry a constant "Protected page" title and a `noindex` robots meta; the wrapper's meta CSP survives `document.write` and therefore governs decrypted pages, blocking every `<script src>`.
+- The CLI supports `--passphrase-env`, `--id`, `--iterations`, `--remember`, `--html-root`, `--no-inline`, `--force`, `--version`, and `--help`. Parsing is strict (unknown options and missing values are fatal, not guessed), interactive passphrase entry is confirmed, and startup warnings cover `--passphrase` visibility, below-default iteration counts, and generic inferred site ids.
+- `veil.js` guards `main()` behind `require.main` and exports its pure/crypto/payload surface (`buildAad`, `generateSiteKeys`, `encryptPage`, `buildPayloadMeta`, `validatePayload`, `generateWrapper`, `extractPayload`, `decryptPayload`, the inlining helpers), so it can be required as a library and used for verification tooling.
+- Two test suites: the zero-dependency Node suite (`npm test`) and a dev-only Playwright browser suite (`npm run test:browser`) that exercises the real runtime — Web Crypto, `document.write`, the CSP, storage tiers, logout, and the unlock form. Playwright is a dev dependency only; the shipped artifact stays zero-dependency.
 - The tool has been exercised against a GitHub Pages-style subtree deployment.
 
 ### Current limits
 
-- Non-HTML assets remain public unless handled separately.
-- Multiple protected zones require multiple CLI invocations; there is no manifest/config mode yet.
-- There is no built-in local dev server or decrypt/inspect helper command.
-- There is no published npm package or programmatic API yet.
-- Persistent unlock state still relies on browser storage, so same-origin JS remains a meaningful risk.
+- Non-HTML assets remain public unless handled separately; only provably-unreachable inlined CSS/JS is dropped.
+- Multiple protected zones require chaining CLI invocations through successive output directories; there is no manifest/config mode yet.
+- There is no built-in local dev server or decrypt/inspect helper command, so verification is still a manual checklist.
+- There is no published npm package; the exported library surface is a testability seam, not a committed public API.
+- Persistent unlock state still relies on browser storage, so any JS on the origin remains a meaningful risk.
+- Payload authentication binds a page to its path, but whole-tuple or whole-file substitution and rollback to an earlier build remain out of scope.
 
 ## Design Principles
 
@@ -76,8 +81,11 @@ Veil does not protect against:
 - weak passphrases and offline brute-force
 - repo compromise
 - host compromise serving modified JS
-- same-origin XSS reading browser storage
-- metadata leakage from page count, file sizes, public asset paths, and directory structure
+- any JavaScript running on the origin — not just injected XSS, but third-party
+  tags on public pages of a selective deployment — reading the cached `MK` from
+  browser storage and decrypting the public wrappers
+- metadata leakage from page count, file sizes, public asset paths, directory
+  structure, and each payload's `path` field (the page's public URL path)
 
 This is the right tool when the alternative is “leave it public and hope nobody notices.”
 
@@ -96,7 +104,7 @@ GitHub Pages and similar hosts are a good way to publish encrypted artifacts, bu
 
 ### The real tradeoff is browser storage
 
-`localStorage` and `sessionStorage` are convenient, but same-origin JS can read them. That means “remember this device” is acceptable only as a convenience feature, not as real security. Veil defaults to `sessionStorage` and makes persistent storage opt-in.
+`localStorage` and `sessionStorage` are convenient, but any JS on the origin can read them — no injection bug required, and a third-party tag on a *public* page of a selective deployment counts. A cached `MK` is password-equivalent access to that site, and `sessionStorage` shortens its lifetime without narrowing which scripts may read it. That means “remember this device” is acceptable only as a convenience feature, not as real security. Veil defaults to `sessionStorage`, makes persistent storage opt-in, and the guidance is a dedicated origin for protected content with no third-party JS anywhere on it.
 
 ## Core Architecture
 
@@ -116,14 +124,15 @@ This keeps the UX simple while avoiding raw-passphrase persistence.
 
 For each build, Veil:
 
-1. Reads the input directory.
+1. Reads the input directory, rejecting any symlink inside it. Files it encrypts or inlines must be valid UTF-8; passthrough files are copied byte-for-byte and not decoded.
 2. Inlines local CSS and JS into each HTML file unless `--no-inline` is set.
 3. Generates one random 256-bit site master key `MK`.
 4. Derives a 256-bit `KEK` from the passphrase using `PBKDF2-HMAC-SHA256`, a random site salt, and a configurable iteration count.
 5. Wraps `MK` with `KEK`.
-6. Encrypts each HTML document using `AES-256-GCM` with `MK` and a fresh random IV per file.
-7. Emits one encrypted wrapper HTML per input HTML file.
-8. Copies non-HTML assets unchanged.
+6. Encrypts each HTML document using `AES-256-GCM` with `MK`, a fresh random IV per file, and an AAD binding the page to its output-relative path.
+7. Emits one encrypted wrapper HTML per input HTML file, into a temporary staging directory.
+8. Copies non-HTML assets, minus the ones inlining proved unreachable.
+9. Publishes the staging directory over the output path on success — replacing a non-empty destination only with `--force` — and deletes it on failure, so a failed build never leaves a half-written artifact.
 
 ### Runtime flow
 
@@ -210,14 +219,13 @@ If storage is compromised, the attacker gains the ability to decrypt this site o
 
 Storage keys must be site-scoped because project sites under `username.github.io` share the same origin.
 
-Recommended keys:
+One key is used, built from the payload's own format version:
 
 ```text
 veil:v2:<site-id>:mk
-veil:v2:<site-id>:meta
 ```
 
-`<site-id>` defaults to the output directory basename, with a CLI flag to override it explicitly.
+`<site-id>` defaults to the output directory basename, with `--id` to override it explicitly. Veil warns when an inferred id is a generic build-directory name (`dist`, `public`, `_site`, …), since those collide on a shared origin.
 
 ### Logout and recovery
 
@@ -258,7 +266,7 @@ Policy:
 - inline local CSS and JS by default (relative and root-relative, quoted and unquoted)
 - rewrite relative `url()`/`@import` inside inlined CSS to stay page-resolvable
 - leave external URLs untouched, with a build warning for the scripts and stylesheets the page CSP will block (cross-origin images and fonts referenced from CSS are blocked too, but are not individually reported)
-- require UTF-8 for HTML and inlined assets; fail the build otherwise
+- require UTF-8 for HTML being encrypted and CSS/JS being inlined, failing the build otherwise; passthrough files are copied byte-for-byte and never decoded
 - copy non-HTML assets as-is, except assets inlined everywhere and referenced by nothing public — those are omitted (inlined JS is omitted only when the whole site is encrypted (no public HTML) and no other JS survives publicly, since module graphs and inline event handlers are not scanned)
 - warn clearly that copied assets remain public
 
@@ -297,12 +305,17 @@ Options:
   --remember            Check "Remember this device" by default
   --html-root <dir>     Encrypt only HTML under this input-relative dir (repeatable)
   --no-inline           Skip local CSS/JS inlining
-  --help                Show help
+  --force               Replace a non-empty output directory
+  --version             Print the veil version
+  --help                Show this help
 ```
+
+Unknown options and options missing their value are fatal rather than guessed,
+so `--id --force` is a forgotten argument, not a site id of `--force`.
 
 Examples:
 
-Interactive local run:
+Interactive local run (the passphrase is typed twice and confirmed):
 
 ```bash
 node veil.js ./site ./public --id my-project
@@ -388,7 +401,11 @@ Operational notes:
 - scope storage keys by repo or explicit site ID
 - use `--html-root` when only part of the published site should be protected
 - passphrase rotation is “change secret, rebuild, re-share passphrase”
-- multiple protected zones can be handled by chaining Veil invocations
+- multiple protected zones are handled by chaining Veil invocations through
+  successive output directories (each run's output is the next run's input);
+  two runs cannot share one output directory, because the second would refuse
+  the non-empty destination and `--force` would discard the first zone
+- pass `--force` in pipelines that reuse a build directory across runs
 
 ## Comparison With Existing Tools
 
@@ -423,11 +440,17 @@ The current scope is intentionally narrow and opinionated:
 
 ## Near-Term Roadmap
 
-1. Tighten docs and examples around GitHub Pages and other staged-output deploys.
-2. Add a config or manifest mode so multiple protected zones can be declared in one run.
-3. Improve local verification ergonomics with something like `veil serve` and/or `veil decrypt`.
+1. Add a `veil verify` command. Verification is currently a manual checklist
+   built out of `grep` and `node -e` against the exported payload helpers;
+   folding it into the CLI is the highest-value next step, since a wrong
+   `--html-root` silently publishes plaintext and nothing catches it today.
+2. Add a config or manifest mode so multiple protected zones can be declared in
+   one run instead of chained through successive output directories.
+3. Improve local verification ergonomics further with something like
+   `veil serve` and/or `veil decrypt`.
 4. Decide whether to publish a package in addition to the canonical single-file CLI.
-5. Expand automated verification around real browser flows and end-to-end fixture sites.
+5. Publish immutable, digest-verifiable artifacts (release tags or signed
+   releases) so vendoring does not depend on commit-SHA pinning by hand.
 
 ## Future Work
 
