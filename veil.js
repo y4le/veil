@@ -506,7 +506,9 @@ function resolveAssetPath(baseDir, urlPath, inputRoot) {
     const real = fs.realpathSync(resolved);
     const realRoot = fs.realpathSync(inputRoot);
     const rel = path.relative(realRoot, real);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    // '..' must match only as a whole path segment: a real in-root file
+    // named '..weird.css' yields rel '..weird.css' and is not an escape.
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
     return real;
   } catch {
     return null; // file doesn't exist

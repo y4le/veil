@@ -519,14 +519,107 @@ describe('asset inlining', () => {
     assert.ok(!html.includes('body{color:blue}'));
   });
 
-  it('blocks path traversal', () => {
+  // Confinement tests point at files that really exist outside the input
+  // root. A reference to a path that does not exist proves nothing: the
+  // resolver fails on the missing file long before the confinement check, so
+  // such a test passes even with the check deleted.
+  it('blocks traversal to a real file outside the input root', () => {
+    const secret = path.join(dir, 'outside-secret.css');
+    fs.writeFileSync(secret, 'body{--secret:LEAKME}');
     const siteDir = setupSite(dir, {
-      'index.html': '<html><head><link rel="stylesheet" href="../../etc/passwd"></head><body>x</body></html>',
+      'index.html': '<html><head><link rel="stylesheet" href="../outside-secret.css"></head><body>x</body></html>',
     });
-    const outDir = path.join(dir, 'out-traversal');
-    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    // The reference must actually reach the sentinel, or the rest is vacuous.
+    assert.equal(
+      fs.realpathSync(path.resolve(siteDir, '../outside-secret.css')),
+      fs.realpathSync(secret),
+      'fixture layout must put the sentinel exactly one level above the input root'
+    );
+    const outDir = path.join(dir, 'out-traversal-real');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
     const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8')), 'test');
-    assert.match(html, /href="\.\.\/\.\.\/etc\/passwd"/);
+    assert.ok(!html.includes('LEAKME'), 'a file outside the input root must never be inlined');
+    assert.match(html, /href="\.\.\/outside-secret\.css"/, 'the reference is left untouched');
+    assert.match(r.stderr, /\.\.\/outside-secret\.css: stylesheet not found inside the input directory/);
+    assert.ok(!fs.existsSync(path.join(outDir, 'outside-secret.css')), 'the sentinel must not be copied out');
+  });
+
+  it('blocks root-relative traversal escaping the input root', () => {
+    const secret = path.join(dir, 'outside-secret.css');
+    fs.writeFileSync(secret, 'body{--secret:LEAKME}');
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><head><link rel="stylesheet" href="/../outside-secret.css"></head><body>x</body></html>',
+    });
+    // Root-relative hrefs resolve against the input root, so this one lands on
+    // the sentinel just above it.
+    assert.equal(
+      fs.realpathSync(path.join(siteDir, '../outside-secret.css')),
+      fs.realpathSync(secret),
+      'fixture layout must put the sentinel exactly one level above the input root'
+    );
+    const outDir = path.join(dir, 'out-traversal-rootrel');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8')), 'test');
+    assert.ok(!html.includes('LEAKME'), 'a root-relative escape must never be inlined');
+    assert.match(html, /href="\/\.\.\/outside-secret\.css"/, 'the reference is left untouched');
+    assert.match(r.stderr, /\/\.\.\/outside-secret\.css: stylesheet not found inside the input directory/);
+    assert.ok(!fs.existsSync(path.join(outDir, 'outside-secret.css')), 'the sentinel must not be copied out');
+  });
+
+  it('does not confuse a sibling directory sharing the input root prefix', () => {
+    // <parent>/site and <parent>/site-secrets: the root's path is a string
+    // prefix of the sibling's, so a startsWith() containment check would call
+    // the sibling "inside" the root.
+    const parent = fs.mkdtempSync(path.join(dir, 'prefix-'));
+    const inputDir = path.join(parent, 'site');
+    const sibling = path.join(parent, 'site-secrets');
+    fs.mkdirSync(inputDir);
+    fs.mkdirSync(sibling);
+    fs.writeFileSync(path.join(sibling, 'secret.css'), 'body{--secret:LEAKME}');
+    fs.writeFileSync(
+      path.join(inputDir, 'index.html'),
+      '<html><head><link rel="stylesheet" href="../site-secrets/secret.css"></head><body>x</body></html>'
+    );
+    assert.ok(fs.existsSync(path.resolve(inputDir, '../site-secrets/secret.css')), 'the sentinel must be reachable');
+    const outDir = path.join(parent, 'out');
+    const r = run([inputDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8')), 'test');
+    assert.ok(!html.includes('LEAKME'), 'a prefix-sharing sibling is still outside the input root');
+    assert.match(html, /href="\.\.\/site-secrets\/secret\.css"/);
+    assert.match(r.stderr, /site-secrets\/secret\.css: stylesheet not found inside the input directory/);
+    assert.ok(!fs.existsSync(path.join(outDir, 'secret.css')), 'the sentinel must not be copied out');
+  });
+
+  it('inlines a file whose name merely starts with dots', () => {
+    // "sub/..weird.css" is an ordinary file inside the root; only its name
+    // begins with dots. Confinement must compare resolved paths, not hunt for
+    // ".." as a substring.
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><head><link rel="stylesheet" href="sub/..weird.css"></head><body>x</body></html>',
+      'sub/..weird.css': 'body{color:fuchsia}',
+    });
+    const outDir = path.join(dir, 'out-dotname');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8')), 'test');
+    assert.match(html, /<style>body\{color:fuchsia\}/);
+    assert.ok(!html.includes('href="sub/..weird.css"'));
+  });
+
+  it('inlines a root-level file whose name starts with dots', () => {
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><head><link rel="stylesheet" href="..weird.css"></head><body>x</body></html>',
+      '..weird.css': 'body{color:fuchsia}',
+    });
+    const outDir = path.join(dir, 'out-dotname-root');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8')), 'test');
+    assert.match(html, /<style>body\{color:fuchsia\}/);
+    assert.ok(!html.includes('href="..weird.css"'));
   });
 
   it('preserves media attribute on inlined CSS', () => {
