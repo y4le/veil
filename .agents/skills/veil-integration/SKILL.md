@@ -128,18 +128,36 @@ Use `--remember` only if the target UX should default to "Remember this device."
   the "encrypted N HTML file(s)" count must match the number of pages you
   meant to protect, and the "copying N non-HTML file(s) unencrypted" /
   "leaving N HTML file(s) public" lines must be expected.
-- Assert that *every* HTML file that should be protected carries a payload —
-  enumerate the output, do not spot-check:
+- Run `veil verify` on the output — it is the audit, not a spot check:
 
   ```bash
-  grep -rL --include='*.[Hh][Tt][Mm][Ll]' --include='*.[Hh][Tt][Mm]' 'id="veil-payload"' ./_encrypted
+  node ./tools/veil.js verify ./_encrypted \
+    --input ./site \
+    --id my-project \
+    --passphrase-env VEIL_PASSPHRASE
   ```
 
-  For a full-site build that must print nothing. AGENT.md has a stronger
-  `node -e` version that also validates each payload and checks its site id.
-- Grep for several canary strings drawn from different source pages, not one.
-- For selective builds, list the HTML that remains public (the command above)
-  and confirm that exact set is what the user intended. State it in your report.
+  Verify is fail-closed: with no `--html-root`, every HTML file in the output
+  must be a valid, current-format wrapper sealed for the path it sits at. It
+  also checks cross-page metadata consistency, IV uniqueness, and that each
+  wrapper still byte-matches the one Veil generates for its own payload.
+  `--input` adds stale-file, missing-file, and passthrough-integrity checks;
+  a passphrase adds a real decryption pass. Exit 0 clean, 1 errors, 2 the
+  audit could not run — `--json` gives a report with stable finding codes.
+- For a selective build, pass the same `--html-root` values you built with.
+  HTML outside them is then reported as public rather than failed, and verify
+  prints the exact list. Confirm that list is what the user intended, and state
+  it in your report — this is the check that catches a wrong `--html-root`.
+- For chained zones, run verify once per zone against the final artifact with
+  that zone's root, id, and passphrase — and run every zone. Outside the
+  audited roots, only a byte-exact wrapper is treated as one; any other
+  payload-looking page (a tampered wrapper from another zone, or public HTML
+  quoting a payload) is warned about and listed as public, because Veil cannot
+  separate those without a real HTML parser. Each zone's own run is what turns
+  that warning into an error. With `--input`, compare each stage against the
+  input to that Veil invocation, not the original tree.
+- A warning that a non-HTML input file is absent from the output is expected
+  when its contents were inlined into encrypted pages.
 
 ### In a real browser
 

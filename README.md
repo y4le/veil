@@ -24,6 +24,9 @@ Encrypt static HTML sites at build time. Veil wraps each HTML file in a self-con
 # Encrypt a site (omit --passphrase to be prompted, with confirmation)
 node veil.js ./my-site ./encrypted --passphrase "secret" --id my-project
 
+# Audit what you are about to publish
+node veil.js verify ./encrypted --input ./my-site --id my-project
+
 # Serve and test
 python3 -m http.server 8765 --directory ./encrypted
 ```
@@ -76,6 +79,7 @@ Runtime behavior worth knowing:
 
 ```
 Usage: veil <input-dir> <output-dir> [options]
+       veil verify <output-dir> [options]
 
 Options:
   --passphrase <pass>   Set passphrase (omit to prompt interactively)
@@ -128,6 +132,73 @@ directories, not repeated runs into one directory; see
 [`protected-zones.md`](.agents/skills/veil-integration/references/protected-zones.md).
 Note that any script on a public page can read the cached key for the protected
 zones — see the threat model below.
+
+### Verifying a Build
+
+`veil verify` audits an output directory before you publish it. It is the
+answer to the question a build log cannot settle: *is every page that should be
+protected actually protected?*
+
+```
+Usage: veil verify <output-dir> [options]
+
+Options:
+  --html-root <dir>     Audit only this output-relative dir (repeatable)
+  --input <dir>         Compare against the input directory this build was made from
+  --id <site-id>        Require this exact site id
+  --passphrase <pass>   Verify decryption with this passphrase
+  --passphrase-env <n>  Verify decryption with the passphrase in env variable <n>
+  --prompt-passphrase   Verify decryption with a passphrase typed at the terminal
+  --json                Emit the report as JSON
+  --help                Show this help
+```
+
+It is **fail-closed**. With no `--html-root`, every HTML file in the output must
+be a valid, current-format Veil wrapper — one plaintext page fails the audit.
+With `--html-root`, HTML outside those roots is reported as public instead, and
+the exact list is printed so a wrong root is visible rather than silent.
+
+What each stage checks:
+
+- **Always.** Inside the audited scope, every HTML file must be a canonical
+  wrapper: a valid, current-format payload, sealed for the path it actually
+  sits at, wrapped in bytes identical to what Veil generates for that payload —
+  which catches a page edited, minified, or re-CSP'd after the build. The scope
+  must also agree on its shared site metadata, and every page IV must be
+  unique. Outside the scope, only a byte-exact wrapper is certain to be one;
+  see the chained-zones note below. Note what this
+  does *not* prove: a canonical wrapper regenerated around rewritten payload
+  data still matches, and generated pages are exempt from the `--input` byte
+  comparison, so the decryption stage below is the only one that authenticates
+  the ciphertext and key metadata themselves.
+- **`--input`.** Stale files left in the output, input files that never made it
+  there, and passthrough files that no longer match their source. A *non-HTML*
+  file missing from the output is only a warning: an inlined asset that nothing
+  public can reach is deliberately omitted.
+- **A passphrase.** The master key is unwrapped once and every page in scope is
+  decrypted, so a wrong passphrase is reported once rather than as N page
+  failures. Supply it with `--passphrase-env` in CI or `--prompt-passphrase`
+  locally; without any of them the decryption stage is skipped and says so.
+
+Exit codes are `0` clean, `1` errors found, `2` the audit could not be performed
+(bad arguments, a missing directory, an unusable passphrase source) — so `set -e`
+is enough in CI. Warnings alone exit 0. `--json` emits a report with stable
+finding codes:
+
+```bash
+node veil.js verify ./_encrypted --json | jq '.findings[] | {code, path}'
+```
+
+For chained zones, run verify once per zone with that zone's root, id, and
+passphrase — and run *every* zone, because that is where the guarantee lives.
+Outside the audited roots Veil deliberately does not guess. Only a page whose
+bytes exactly equal a generated wrapper is certainly a wrapper; any other
+payload-looking page — an edited or minified wrapper from another zone, but
+equally a public page quoting a payload in a `<textarea>` or code sample — is
+the same bytes to anything short of a real HTML parser. Veil warns about those
+and lists them as public rather than failing them, so an out-of-scope wrapper
+that was tampered with is caught by *its own* zone's run. Skipping a zone
+skips its enforcement.
 
 ## Integrate Into Your Project
 

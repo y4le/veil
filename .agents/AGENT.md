@@ -145,7 +145,7 @@ After resolving the questions above, follow the appropriate reference:
 
 A single grep for one canary string is not verification — it passes even when
 most of the site was published in plaintext. A mis-typed `--html-root` produces
-a clean exit code and a fully public site. Work through all five steps.
+a clean exit code and a fully public site. Work through all three steps.
 
 **(a) Build into a fresh, empty output directory.**
 
@@ -173,74 +173,62 @@ The last count must match the number of HTML files you intended to protect. The
 encrypted roots — for a full-site build it must not appear at all, and for a
 selective build N must be exactly the public pages you expect.
 
-**(b) Assert every protected output file actually carries a payload.**
+**(b) Run `veil verify` on the output.**
 
-Enumerate the HTML in the output, not just the one page you remember. Quick
-version:
-
-```bash
-# prints any HTML file with no veil payload — must be empty for a full-site build
-grep -rL --include='*.[Hh][Tt][Mm][Ll]' --include='*.[Hh][Tt][Mm]' 'id="veil-payload"' ./_encrypted
-```
-
-(It exits 1 when it lists nothing, i.e. when everything is protected — add
-`|| true` if you run it under `set -e`.)
-
-Stronger version, using Veil's exported helpers to also check the payload
-validates and carries the intended site id:
+This is the step that catches a wrong `--html-root`, a file left over from an
+earlier build, and a wrapper that was mangled after Veil wrote it. It replaces
+the hand-rolled greps that used to live here.
 
 ```bash
-node -e '
-const fs = require("fs"), path = require("path");
-const { extractPayload, validatePayload, isHtmlFile } = require("./tools/veil.js");
-const [dir, wantId] = process.argv.slice(1);
-const walk = (d) => fs.readdirSync(d, { withFileTypes: true })
-  .flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
-let bad = 0;
-for (const f of walk(dir).filter(isHtmlFile)) {
-  const p = extractPayload(fs.readFileSync(f, "utf8"));
-  const errs = p ? validatePayload(p) : ["no veil-payload script — this file is PUBLIC"];
-  if (!p || errs.length || (wantId && p.siteId !== wantId)) {
-    bad++; console.log("UNPROTECTED:", f, p ? `id=${p.siteId} ${errs.join("; ")}` : errs[0]);
-  }
-}
-console.log(bad ? `FAIL: ${bad} file(s)` : "OK: every HTML file is protected");
-process.exit(bad ? 1 : 0);
-' ./_encrypted my-project
+node ./tools/veil.js verify ./_encrypted \
+  --input ./site \
+  --id my-project \
+  --passphrase-env VEIL_PASSPHRASE
 ```
 
-For a **selective** build, point that at the protected subtree
-(`./_encrypted/clients my-project`), not the whole output.
+Verify is **fail-closed**: with no `--html-root`, every HTML file in the output
+must be a valid, current-format Veil wrapper sealed for the path it sits at, and
+a single plaintext page fails the audit. Exit 0 means the audit ran clean, 1
+means it found errors, 2 means it could not run at all (bad arguments, a missing
+directory, an unusable passphrase source) — so `set -e` is enough in CI.
 
-**(c) Grep for several canaries, from different source pages.**
+`--input` adds correspondence checks: output files with no input counterpart,
+HTML that never made it to the output, and passthrough files that no longer
+match their source. Note the limit: a wrapper left at the *same* path by an
+earlier build of the same site is self-consistent, so verify cannot tell it
+from a current one — rollback is out of scope (see PLAN.md), and a fresh output
+directory is what prevents it.
+`--passphrase-env` adds a real decryption pass (one PBKDF2 derivation for the
+whole site). Add `--json` for a machine-readable report with stable finding
+codes. A missing *non-HTML* input file is only a warning: an inlined CSS/JS file
+that nothing public can reach is deliberately omitted from the output.
 
-One string per protected area, drawn from pages built by different templates —
-a heading, a client name, a table caption:
+For a **selective** build, name the protected roots — the same ones you passed
+to the build:
 
 ```bash
-for s in "Acme Q3 Proposal" "internal-only" "Day 3 — Kyoto"; do
-  grep -rq "$s" ./_encrypted && echo "LEAK: $s" || echo "ok: $s"
-done
+node ./tools/veil.js verify ./_encrypted --html-root clients --input ./site --id my-project
 ```
 
-Pick the strings out of the *source* files, and confirm they were really there —
-a typo'd canary reports "ok" forever. On a selective build, also grep for a
-string you expect to still be public; if that one is not found either, the whole
-check is proving nothing.
+HTML outside those roots is then reported as public rather than failed, and
+verify prints the exact list:
 
-**(d) For selective builds, list what stayed public and confirm the list.**
-
-This is the step that catches a wrong `--html-root`. Do not skip it because the
-count in the build log "looked about right":
-
-```bash
-grep -rL --include='*.[Hh][Tt][Mm][Ll]' --include='*.[Hh][Tt][Mm]' 'id="veil-payload"' ./_encrypted
+```text
+Public HTML (outside the audited roots — served as plaintext):
+  index.html
+  about.html
 ```
 
-Every path printed is served in the clear. Compare it against what the user
-said should stay public, and say so explicitly in your report.
+Compare that list against what the user said should stay public, and state it
+explicitly in your report. Do not skip it because the count in the build log
+"looked about right".
 
-**(e) Serve it locally and unlock in a real browser.**
+For **chained protected zones**, run verify once per zone against the final
+artifact, naming that zone's root, id, and passphrase; wrappers from the other
+zones are reported as out-of-scope, not as failures. With `--input`, compare
+each stage against the input to *that* Veil invocation, not the original tree.
+
+**(c) Serve it locally and unlock in a real browser.**
 
 ```bash
 python3 -m http.server 8765 --directory ./_encrypted
@@ -309,6 +297,22 @@ Options:
   --force               Replace a non-empty output directory
   --version             Print the veil version
   --help                Show this help
+```
+
+```
+Usage: veil verify <output-dir> [options]
+
+Options:
+  --html-root <dir>     Audit only this output-relative dir (repeatable)
+  --input <dir>         Compare against the input directory this build was made from
+  --id <site-id>        Require this exact site id
+  --passphrase <pass>   Verify decryption with this passphrase
+  --passphrase-env <n>  Verify decryption with the passphrase in env variable <n>
+  --prompt-passphrase   Verify decryption with a passphrase typed at the terminal
+  --json                Emit the report as JSON
+  --help                Show this help
+
+Exit codes: 0 clean, 1 errors found, 2 the audit could not be performed.
 ```
 
 Behavior worth knowing before you wire a pipeline:

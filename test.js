@@ -1597,3 +1597,772 @@ describe('module exports', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Verify command tests
+// ---------------------------------------------------------------------------
+
+describe('verify command', () => {
+  let dir;
+  const PASS = 'verify-passphrase';
+  const SITE_ID = 'verify-site';
+
+  before(() => { dir = tmpDir(); });
+  after(() => cleanup(dir));
+
+  /** Build a site and return both trees, asserting the build itself succeeded. */
+  function build(files, extraArgs = []) {
+    const siteDir = setupSite(dir, files);
+    const outDir = fs.mkdtempSync(path.join(dir, 'out-'));
+    const r = run([
+      siteDir, outDir,
+      '--passphrase', PASS, '--iterations', '100000', '--id', SITE_ID,
+      ...extraArgs,
+    ]);
+    assert.equal(r.code, 0, `build failed: ${r.stderr}`);
+    return { siteDir, outDir };
+  }
+
+  function verify(args) {
+    return run(['verify', ...args]);
+  }
+
+  /** Run verify in JSON mode; the report must be the only thing on stdout. */
+  function report(args) {
+    const r = verify([...args, '--json']);
+    let parsed;
+    try {
+      parsed = JSON.parse(r.stdout);
+    } catch (err) {
+      assert.fail(`stdout is not JSON (${err.message}): ${r.stdout}`);
+    }
+    return { ...r, report: parsed };
+  }
+
+  const codes = (rep) => rep.findings.map((f) => f.code);
+  const find = (rep, code) => rep.findings.filter((f) => f.code === code);
+
+  /**
+   * Replace a wrapper's payload without going through generateWrapper, for
+   * payloads the generator refuses to write (wrong version, broken schema).
+   */
+  function writeRawPayload(file, payload) {
+    const html = fs.readFileSync(file, 'utf8');
+    const json = JSON.stringify(payload)
+      .replace(/</g, '\\u003C').replace(/>/g, '\\u003E').replace(/&/g, '\\u0026');
+    fs.writeFileSync(
+      file,
+      html.replace(
+        /(<script id="veil-payload" type="application\/json">)[^<]+(<\/script>)/,
+        (m, open, close) => open + json + close
+      )
+    );
+  }
+
+  const SIMPLE = {
+    'index.html': '<html><body><h1>Home</h1></body></html>',
+    'about.htm': '<html><body><h1>About</h1></body></html>',
+    'blog/post.html': '<html><body><h1>Post</h1></body></html>',
+  };
+
+  // -- CLI surface ---------------------------------------------------------
+
+  it('shows verify help and exits 0', () => {
+    const r = verify(['--help']);
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /Usage: veil verify <output-dir>/);
+    assert.match(r.stdout, /--prompt-passphrase/);
+  });
+
+  it('mentions the verify subcommand in the main help', () => {
+    const r = run(['--help']);
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /veil verify <output-dir>/);
+  });
+
+  it('exits 2 when the output directory is missing from the command line', () => {
+    const r = verify([]);
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /requires an output directory/);
+  });
+
+  it('exits 2 on an unknown option, an extra positional, or a valueless flag', () => {
+    assert.equal(verify(['out', '--nope']).code, 2);
+    assert.equal(verify(['out', 'extra']).code, 2);
+    assert.equal(verify(['out', '--id']).code, 2);
+  });
+
+  it('exits 2 when the output directory does not exist or is a file', () => {
+    const missing = verify([path.join(dir, 'no-such-dir')]);
+    assert.equal(missing.code, 2);
+    assert.match(missing.stderr, /output directory does not exist/);
+
+    const file = path.join(dir, 'a-file');
+    fs.writeFileSync(file, 'x');
+    const notDir = verify([file]);
+    assert.equal(notDir.code, 2);
+    assert.match(notDir.stderr, /output path is not a directory/);
+  });
+
+  it('exits 2 when the input directory does not exist', () => {
+    const { outDir } = build(SIMPLE);
+    const r = verify([outDir, '--input', path.join(dir, 'no-such-input')]);
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /input directory does not exist/);
+  });
+
+  // -- Clean builds --------------------------------------------------------
+
+  it('passes a clean full-site build', () => {
+    const { outDir } = build(SIMPLE);
+    const r = verify([outDir, '--id', SITE_ID]);
+    assert.equal(r.code, 0, r.stdout);
+    assert.match(r.stdout, /^PASS/m);
+  });
+
+  it('reports a clean build as structured JSON on stdout alone', () => {
+    const { outDir } = build(SIMPLE);
+    const r = report([outDir, '--id', SITE_ID]);
+    assert.equal(r.code, 0);
+    assert.equal(r.report.ok, true);
+    assert.equal(r.report.reportVersion, 1);
+    assert.equal(r.report.stats.encryptedHtml, 3);
+    assert.equal(r.report.stats.publicHtml, 0);
+    assert.equal(r.report.inputDir, null);
+    assert.deepEqual(r.report.scope, { htmlRoots: [], siteId: SITE_ID });
+    assert.equal(r.report.checks.decryption.status, 'skipped');
+    assert.equal(r.report.checks.correspondence.status, 'skipped');
+    assert.equal(r.report.counts.errors, 0);
+  });
+
+  it('audits .htm as well as .html', () => {
+    const { outDir } = build(SIMPLE);
+    const r = report([outDir]);
+    const audited = r.report.stats.encryptedHtml;
+    assert.equal(audited, 3, 'about.htm must be counted');
+  });
+
+  it('reports every path in posix form and sorts findings deterministically', () => {
+    const { outDir } = build(SIMPLE);
+    fs.writeFileSync(path.join(outDir, 'blog', 'plain.html'), '<html><body>plain</body></html>');
+    const first = report([outDir]);
+    const second = report([outDir]);
+    assert.deepEqual(first.report.findings, second.report.findings);
+    for (const f of first.report.findings) {
+      if (f.path !== null) assert.doesNotMatch(f.path, /\\/);
+    }
+    assert.deepEqual(codes(first.report), ['html_not_encrypted', 'iterations_below_default']);
+    assert.equal(find(first.report, 'html_not_encrypted')[0].path, 'blog/plain.html');
+  });
+
+  // -- Fail-closed scope ---------------------------------------------------
+
+  it('fails when any HTML in scope is unencrypted', () => {
+    const { outDir } = build({ ...SIMPLE, 'public/open.html': '<html><body>open</body></html>' },
+      ['--html-root', 'blog']);
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.equal(r.report.ok, false);
+    const unencrypted = find(r.report, 'html_not_encrypted').map((f) => f.path);
+    assert.deepEqual(unencrypted, ['about.htm', 'index.html', 'public/open.html']);
+  });
+
+  it('accepts public HTML when --html-root declares the protected scope', () => {
+    const { outDir } = build({ ...SIMPLE, 'public/open.html': '<html><body>open</body></html>' },
+      ['--html-root', 'blog']);
+    const r = report([outDir, '--html-root', 'blog']);
+    assert.equal(r.code, 0);
+    assert.equal(r.report.stats.encryptedHtml, 1);
+    assert.equal(r.report.stats.publicHtml, 3);
+    assert.deepEqual(
+      r.report.publicHtml.map((p) => p.path),
+      ['about.htm', 'index.html', 'public/open.html']
+    );
+    assert.ok(r.report.publicHtml.every((p) => p.allowed));
+  });
+
+  it('fails an --html-root that matches nothing, even alongside one that does', () => {
+    const { outDir, siteDir } = build(SIMPLE, ['--html-root', 'blog']);
+    const r = report([outDir, '--html-root', 'blog', '--html-root', 'blogg']);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'html_root_unmatched').length, 1);
+    assert.match(find(r.report, 'html_root_unmatched')[0].message, /blogg matches no HTML file in the output tree/);
+
+    const withInput = report([outDir, '--input', siteDir, '--html-root', 'blog', '--html-root', 'blogg']);
+    assert.match(
+      find(withInput.report, 'html_root_unmatched')[0].message,
+      /blogg matches no HTML file in the input tree/
+    );
+  });
+
+  it('fails an output directory with no HTML at all', () => {
+    const empty = fs.mkdtempSync(path.join(dir, 'empty-'));
+    const r = report([empty]);
+    assert.equal(r.code, 1);
+    assert.deepEqual(codes(r.report), ['no_encrypted_pages']);
+  });
+
+  // -- Wrapper hygiene -----------------------------------------------------
+
+  it('detects a wrapper moved away from the path it was sealed for', () => {
+    const { outDir } = build(SIMPLE);
+    fs.renameSync(path.join(outDir, 'blog', 'post.html'), path.join(outDir, 'blog', 'moved.html'));
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    const mismatch = find(r.report, 'payload_path_mismatch');
+    assert.equal(mismatch.length, 1);
+    assert.equal(mismatch[0].path, 'blog/moved.html');
+    assert.match(mismatch[0].message, /sealed for "blog\/post\.html"/);
+  });
+
+  it('detects a wrapper edited after the build', () => {
+    const { outDir } = build(SIMPLE);
+    const page = path.join(outDir, 'index.html');
+    fs.appendFileSync(page, '\n<!-- injected -->');
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'wrapper_modified').map((f) => f.path), ['index.html']);
+  });
+
+  it('detects a wrapper whose CSP was weakened', () => {
+    const { outDir } = build(SIMPLE);
+    const page = path.join(outDir, 'index.html');
+    fs.writeFileSync(
+      page,
+      fs.readFileSync(page, 'utf8').replace("default-src 'none'", "default-src *")
+    );
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'wrapper_modified').map((f) => f.path), ['index.html']);
+  });
+
+  it('separates a damaged wrapper from an intentionally public page', () => {
+    const { outDir } = build(SIMPLE);
+    const page = path.join(outDir, 'index.html');
+    fs.writeFileSync(
+      page,
+      fs.readFileSync(page, 'utf8').replace(
+        /(<script id="veil-payload" type="application\/json">)[^<]+/,
+        '$1{not json'
+      )
+    );
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    const malformed = find(r.report, 'payload_malformed');
+    assert.equal(malformed.length, 1);
+    assert.match(malformed[0].message, /not valid JSON/);
+    assert.equal(r.report.publicHtml.length, 0, 'a damaged wrapper is not public HTML');
+  });
+
+  it('reads a page that only writes about Veil as ordinary public HTML', () => {
+    const { outDir } = build(SIMPLE, ['--html-root', 'blog']);
+    fs.writeFileSync(
+      path.join(outDir, 'index.html'),
+      '<html><body><p>The payload lives in ' +
+      '&lt;script id="veil-payload" type="application/json"&gt;.</p></body></html>'
+    );
+    const r = report([outDir, '--html-root', 'blog']);
+    assert.equal(r.code, 0, JSON.stringify(r.report.findings));
+    assert.ok(r.report.publicHtml.some((p) => p.path === 'index.html'));
+  });
+
+  it('rejects a page carrying two payload scripts', () => {
+    const { outDir } = build(SIMPLE);
+    const page = path.join(outDir, 'index.html');
+    const html = fs.readFileSync(page, 'utf8');
+    const payloadScript = /<script id="veil-payload" type="application\/json">[^<]+<\/script>/.exec(html)[0];
+    fs.writeFileSync(page, html.replace(payloadScript, payloadScript + payloadScript));
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.match(find(r.report, 'payload_malformed')[0].message, /2 veil-payload scripts/);
+  });
+
+  it('rejects a payload that fails schema validation', () => {
+    const { outDir } = build(SIMPLE);
+    const page = path.join(outDir, 'index.html');
+    const payload = extractPayload(fs.readFileSync(page, 'utf8'));
+    payload.salt = Buffer.alloc(8).toString('base64');
+    writeRawPayload(page, payload);
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.match(find(r.report, 'payload_invalid')[0].message, /salt must be 16 bytes/);
+  });
+
+  it('refuses to certify a payload from an older or newer format', () => {
+    const { outDir } = build(SIMPLE);
+    const legacy = path.join(outDir, 'index.html');
+    const legacyPayload = extractPayload(fs.readFileSync(legacy, 'utf8'));
+    legacyPayload.v = 1;
+    delete legacyPayload.path;
+    writeRawPayload(legacy, legacyPayload);
+
+    const future = path.join(outDir, 'blog', 'post.html');
+    const futurePayload = extractPayload(fs.readFileSync(future, 'utf8'));
+    futurePayload.v = 99;
+    writeRawPayload(future, futurePayload);
+
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    const unsupported = find(r.report, 'payload_version_unsupported');
+    assert.deepEqual(unsupported.map((f) => f.path), ['blog/post.html', 'index.html']);
+    assert.match(unsupported.find((f) => f.path === 'index.html').message, /re-encrypt the source/);
+    assert.match(unsupported.find((f) => f.path === 'blog/post.html').message, /upgrade veil\.js/);
+  });
+
+  // -- Cohort checks -------------------------------------------------------
+
+  it('fails when the site id is not the expected one', () => {
+    const { outDir } = build(SIMPLE);
+    const r = report([outDir, '--id', 'some-other-site']);
+    assert.equal(r.code, 1);
+    const mismatch = find(r.report, 'site_id_mismatch');
+    assert.equal(mismatch.length, 1, 'one finding per distinct wrong id, not one per page');
+    assert.match(mismatch[0].message, /carries site id "verify-site".*3 page\(s\)/);
+  });
+
+  it('detects pages mixed in from a different build', () => {
+    const { outDir } = build(SIMPLE);
+    const other = build(SIMPLE);
+    fs.copyFileSync(path.join(other.outDir, 'index.html'), path.join(outDir, 'index.html'));
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    const inconsistent = find(r.report, 'site_inconsistent');
+    assert.ok(inconsistent.length > 0);
+    assert.ok(inconsistent.some((f) => /different salt/.test(f.message)));
+    assert.equal(find(r.report, 'iv_reuse').length, 0, 'different key material is not IV reuse');
+  });
+
+  it('detects IV reuse under one master key', () => {
+    const { outDir } = build(SIMPLE);
+    const { generateWrapper } = require('./veil.js');
+    const source = extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8'));
+    const target = extractPayload(fs.readFileSync(path.join(outDir, 'blog', 'post.html'), 'utf8'));
+    target.iv = source.iv;
+    fs.writeFileSync(path.join(outDir, 'blog', 'post.html'), generateWrapper(target));
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.equal(find(r.report, 'iv_reuse').length, 1);
+  });
+
+  it('warns, but passes, on an iteration count below the default', () => {
+    const { outDir } = build(SIMPLE);
+    const r = report([outDir]);
+    assert.equal(r.code, 0);
+    assert.equal(r.report.counts.warnings, 1);
+    assert.match(find(r.report, 'iterations_below_default')[0].message, /below the default 600000/);
+  });
+
+  it('reports a symlink in the output tree without abandoning the audit', () => {
+    const { outDir } = build(SIMPLE);
+    fs.symlinkSync(path.join(outDir, 'index.html'), path.join(outDir, 'alias.html'));
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'irregular_file').map((f) => f.path), ['alias.html']);
+    assert.equal(r.report.stats.encryptedHtml, 3, 'the rest of the tree is still audited');
+  });
+
+  it('cannot be blinded to a payload by markup wrapped around it', () => {
+    const { outDir } = build(SIMPLE);
+    const page = path.join(outDir, 'index.html');
+    // `--!>` also ends a comment in a browser, so a tokenizer that only knows
+    // `-->` would treat the rest of this document as commented out. The payload
+    // is still there, and finding it must not depend on parsing the markup.
+    fs.writeFileSync(page, '<!--x--!>' + fs.readFileSync(page, 'utf8'));
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'wrapper_modified').map((f) => f.path), ['index.html']);
+    assert.ok(!r.report.publicHtml.some((p) => p.path === 'index.html'));
+  });
+
+  it('does not fail a public page that quotes wrapper markup', () => {
+    const { outDir } = build(SIMPLE, ['--html-root', 'blog']);
+    // A browser creates no veil-payload element here — the tag text is inside
+    // a JavaScript string — but raw matching cannot know that. Out of scope,
+    // an undecidable page must be reported, never failed.
+    fs.writeFileSync(
+      path.join(outDir, 'index.html'),
+      '<html><body><script>const example = ' +
+      '\'<script id="veil-payload" type="application/json">\';</script>' +
+      '<h1>Public</h1></body></html>'
+    );
+    const r = report([outDir, '--html-root', 'blog']);
+    assert.equal(r.code, 0, JSON.stringify(r.report.findings));
+    assert.ok(r.report.publicHtml.some((p) => p.path === 'index.html'));
+    const warned = find(r.report, 'payload_malformed');
+    assert.equal(warned.length, 1);
+    assert.equal(warned[0].severity, 'warning');
+    assert.match(warned[0].message, /may equally be public HTML/);
+  });
+
+  it('still fails a canonical wrapper relocated outside the audited scope', () => {
+    const { outDir } = build(SIMPLE, ['--html-root', 'blog']);
+    // Byte-exact generated wrapper, so it is unambiguously a wrapper wherever
+    // it sits — and it is not sitting where it was sealed for.
+    fs.renameSync(path.join(outDir, 'blog', 'post.html'), path.join(outDir, 'moved.html'));
+    const r = report([outDir, '--html-root', 'blog']);
+    assert.equal(r.code, 1);
+    const mismatch = find(r.report, 'payload_path_mismatch');
+    assert.deepEqual(mismatch.map((f) => f.path), ['moved.html']);
+    assert.equal(mismatch[0].severity, 'error');
+    assert.equal(r.report.stats.outOfScopeWrappers, 1);
+    assert.ok(!r.report.publicHtml.some((p) => p.path === 'moved.html'));
+  });
+
+  it('does not fail a public page that quotes a real payload in raw text', () => {
+    const { outDir } = build(SIMPLE, ['--html-root', 'blog']);
+    const wrapper = fs.readFileSync(path.join(outDir, 'blog', 'post.html'), 'utf8');
+    const payloadScript =
+      /<script id="veil-payload" type="application\/json">[^<]+<\/script>/.exec(wrapper)[0];
+    // A genuine, schema-valid payload — but inside a textarea, so a browser
+    // creates no payload element and the page is ordinary public HTML.
+    fs.writeFileSync(
+      path.join(outDir, 'index.html'),
+      `<html><body><h1>Example</h1><textarea>${payloadScript}</textarea></body></html>`
+    );
+    const r = report([outDir, '--html-root', 'blog']);
+    assert.equal(r.code, 0, JSON.stringify(r.report.findings));
+    assert.ok(r.report.publicHtml.some((p) => p.path === 'index.html'));
+    assert.equal(r.report.stats.outOfScopeWrappers, 0);
+    const warned = find(r.report, 'wrapper_modified');
+    assert.equal(warned.length, 1);
+    assert.equal(warned[0].severity, 'warning');
+  });
+
+  it('does still fail a quoted real payload when the page is in scope', () => {
+    const { outDir } = build(SIMPLE);
+    const wrapper = fs.readFileSync(path.join(outDir, 'blog', 'post.html'), 'utf8');
+    const payloadScript =
+      /<script id="veil-payload" type="application\/json">[^<]+<\/script>/.exec(wrapper)[0];
+    fs.writeFileSync(
+      path.join(outDir, 'index.html'),
+      `<html><body><textarea>${payloadScript}</textarea></body></html>`
+    );
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.equal(find(r.report, 'wrapper_modified')[0].severity, 'error');
+  });
+
+  it('does still fail the same ambiguous page when it is in scope', () => {
+    const { outDir } = build(SIMPLE);
+    fs.writeFileSync(
+      path.join(outDir, 'index.html'),
+      '<html><body><script>const example = ' +
+      '\'<script id="veil-payload" type="application/json">\';</script>' +
+      '<h1>Public</h1></body></html>'
+    );
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.equal(find(r.report, 'payload_malformed')[0].severity, 'error');
+  });
+
+  it('does not mistake wrapper markup quoted inside a public page for a wrapper', () => {
+    const { outDir } = build(SIMPLE, ['--html-root', 'blog']);
+    fs.writeFileSync(
+      path.join(outDir, 'index.html'),
+      '<html><body>' +
+      '<!-- <div id="veil-prompt"></div> -->' +
+      '<textarea><div id="veil-prompt"></div></textarea>' +
+      '<p>The payload lives in &lt;script id="veil-payload"&gt;.</p>' +
+      '</body></html>'
+    );
+    const r = report([outDir, '--html-root', 'blog']);
+    assert.equal(r.code, 0, JSON.stringify(r.report.findings));
+    assert.equal(r.report.counts.warnings, 1, 'only the iteration-count warning');
+    assert.ok(r.report.publicHtml.some((p) => p.path === 'index.html'));
+  });
+
+  it('reports a wrapper whose payload script was emptied out', () => {
+    const { outDir } = build(SIMPLE);
+    const page = path.join(outDir, 'index.html');
+    fs.writeFileSync(
+      page,
+      fs.readFileSync(page, 'utf8').replace(
+        /(<script id="veil-payload" type="application\/json">)[^<]+/,
+        '$1'
+      )
+    );
+    const r = report([outDir]);
+    assert.equal(r.code, 1);
+    assert.match(find(r.report, 'payload_malformed')[0].message, /no readable contents/);
+  });
+
+  it("catches a zone's own tampered wrapper when that zone is the audited scope", () => {
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><body>Home</body></html>',
+      'zone-a/secret.html': '<html><body>Zone A</body></html>',
+      'zone-b/secret.html': '<html><body>Zone B</body></html>',
+    });
+    const stage1 = fs.mkdtempSync(path.join(dir, 'evade1-'));
+    const stage2 = fs.mkdtempSync(path.join(dir, 'evade2-'));
+    assert.equal(run([siteDir, stage1, '--passphrase', 'a-pass', '--iterations', '100000',
+      '--id', 'zone-a', '--html-root', 'zone-a']).code, 0);
+    assert.equal(run([stage1, stage2, '--passphrase', 'b-pass', '--iterations', '100000',
+      '--id', 'zone-b', '--html-root', 'zone-b']).code, 0);
+
+    // Rename the payload script so the page no longer presents as a wrapper.
+    const zoneA = path.join(stage2, 'zone-a', 'secret.html');
+    fs.writeFileSync(zoneA, fs.readFileSync(zoneA, 'utf8').replace(/veil-payload/g, 'veil_payload'));
+
+    // Auditing zone A — the run that owns that page — fails, which is the
+    // guarantee: every zone is verified by its own invocation.
+    const a = report([stage2, '--html-root', 'zone-a', '--id', 'zone-a']);
+    assert.equal(a.code, 1);
+    assert.deepEqual(find(a.report, 'html_not_encrypted').map((f) => f.path), ['zone-a/secret.html']);
+
+    // The same edit is also caught from any zone once --input is supplied,
+    // because the page is passthrough for the later stage.
+    const b = report([stage2, '--input', stage1, '--html-root', 'zone-b', '--id', 'zone-b']);
+    assert.equal(b.code, 1);
+    assert.deepEqual(
+      find(b.report, 'passthrough_modified').map((f) => f.path),
+      ['zone-a/secret.html']
+    );
+  });
+
+  it('still audits IVs and decryption when pages disagree only about remember', () => {
+    const { outDir } = build(SIMPLE);
+    const { generateWrapper } = require('./veil.js');
+    const page = path.join(outDir, 'index.html');
+    const payload = extractPayload(fs.readFileSync(page, 'utf8'));
+    payload.remember = !payload.remember;
+    fs.writeFileSync(page, generateWrapper(payload));
+
+    const r = report([outDir, '--passphrase', PASS]);
+    assert.equal(r.code, 1);
+    assert.ok(find(r.report, 'site_inconsistent').some((f) => /different remember/.test(f.message)));
+    // remember is not key material, so the decryption pass must still run.
+    assert.equal(r.report.checks.decryption.status, 'passed');
+
+    // ...and the pages must still be one IV group, or reused IVs would hide
+    // behind a disagreement that has nothing to do with the master key.
+    const other = extractPayload(fs.readFileSync(path.join(outDir, 'about.htm'), 'utf8'));
+    const flipped = extractPayload(fs.readFileSync(page, 'utf8'));
+    other.iv = flipped.iv;
+    fs.writeFileSync(path.join(outDir, 'about.htm'), generateWrapper(other));
+    const reused = report([outDir]);
+    assert.equal(find(reused.report, 'iv_reuse').length, 1);
+  });
+
+  // -- Correspondence ------------------------------------------------------
+
+  it('passes correspondence for a clean build, warning about inlined assets', () => {
+    const { siteDir, outDir } = build({
+      'index.html': '<html><head><link rel="stylesheet" href="/style.css"></head><body>Home</body></html>',
+      'style.css': 'body{color:red}',
+    });
+    const r = report([outDir, '--input', siteDir]);
+    assert.equal(r.code, 0);
+    assert.equal(r.report.checks.correspondence.status, 'passed');
+    assert.deepEqual(find(r.report, 'missing_asset').map((f) => f.path), ['style.css']);
+    assert.equal(find(r.report, 'missing_asset')[0].severity, 'warning');
+  });
+
+  it('does not report correspondence as passed over a tree it could not fully read', () => {
+    const { siteDir, outDir } = build(SIMPLE);
+    fs.symlinkSync(path.join(siteDir, 'index.html'), path.join(siteDir, 'link.html'));
+    const r = report([outDir, '--input', siteDir]);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'irregular_file').map((f) => f.path), ['link.html']);
+    assert.equal(r.report.checks.correspondence.status, 'failed');
+    assert.equal(r.report.ok, false);
+
+    // The same holds for an output entry the walk had to skip: it never
+    // reaches the orphan comparison, so that stage did not fully run.
+    const clean = build(SIMPLE);
+    fs.symlinkSync(path.join(clean.outDir, 'index.html'), path.join(clean.outDir, 'orphan.html'));
+    const out = report([clean.outDir, '--input', clean.siteDir]);
+    assert.equal(out.code, 1);
+    assert.deepEqual(find(out.report, 'irregular_file').map((f) => f.path), ['orphan.html']);
+    assert.equal(out.report.checks.correspondence.status, 'failed');
+  });
+
+  it('refuses to compare a build against itself', () => {
+    const { outDir } = build(SIMPLE);
+    const same = verify([outDir, '--input', outDir]);
+    assert.equal(same.code, 2);
+    assert.match(same.stderr, /separate tree/);
+
+    const alias = path.join(dir, `alias-${path.basename(outDir)}`);
+    fs.symlinkSync(outDir, alias);
+    const viaSymlink = verify([outDir, '--input', alias]);
+    assert.equal(viaSymlink.code, 2);
+    assert.match(viaSymlink.stderr, /separate tree/);
+
+    const nested = verify([path.join(outDir, 'blog'), '--input', outDir]);
+    assert.equal(nested.code, 2);
+    assert.match(nested.stderr, /separate tree/);
+  });
+
+  it('detects a stale file left in the output', () => {
+    const { siteDir, outDir } = build(SIMPLE);
+    fs.writeFileSync(path.join(outDir, 'stale.html'), '<html><body>old</body></html>');
+    fs.writeFileSync(path.join(outDir, 'stale.txt'), 'old');
+    const r = report([outDir, '--input', siteDir]);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'orphan').map((f) => f.path), ['stale.html', 'stale.txt']);
+    assert.equal(r.report.checks.correspondence.status, 'failed');
+  });
+
+  it('reports a missing HTML file as an error, not a warning', () => {
+    const { siteDir, outDir } = build(SIMPLE);
+    fs.rmSync(path.join(outDir, 'blog', 'post.html'));
+    const r = report([outDir, '--input', siteDir]);
+    assert.equal(r.code, 1);
+    const missing = find(r.report, 'missing_output');
+    assert.deepEqual(missing.map((f) => f.path), ['blog/post.html']);
+    assert.equal(missing[0].severity, 'error');
+  });
+
+  it('detects a passthrough file modified after the build', () => {
+    const { siteDir, outDir } = build(
+      { ...SIMPLE, 'assets/data.txt': 'original', 'public/open.html': '<html><body>open</body></html>' },
+      ['--html-root', 'blog']
+    );
+    fs.writeFileSync(path.join(outDir, 'assets', 'data.txt'), 'tampered');
+    fs.writeFileSync(path.join(outDir, 'public', 'open.html'), '<html><body>changed</body></html>');
+    const r = report([outDir, '--input', siteDir, '--html-root', 'blog']);
+    assert.equal(r.code, 1);
+    assert.deepEqual(
+      find(r.report, 'passthrough_modified').map((f) => f.path),
+      ['assets/data.txt', 'public/open.html']
+    );
+  });
+
+  it('does not compare a same-size passthrough file by size alone', () => {
+    const { siteDir, outDir } = build(
+      { ...SIMPLE, 'assets/data.txt': 'original' },
+      ['--html-root', 'blog']
+    );
+    fs.writeFileSync(path.join(outDir, 'assets', 'data.txt'), 'originaL');
+    const r = report([outDir, '--input', siteDir, '--html-root', 'blog']);
+    assert.equal(r.code, 1);
+    assert.deepEqual(find(r.report, 'passthrough_modified').map((f) => f.path), ['assets/data.txt']);
+  });
+
+  // -- Decryption ----------------------------------------------------------
+
+  it('decrypts every page with the right passphrase', () => {
+    const { outDir } = build(SIMPLE);
+    const r = report([outDir, '--passphrase', PASS]);
+    assert.equal(r.code, 0);
+    assert.equal(r.report.checks.decryption.status, 'passed');
+    assert.match(r.stderr, /--passphrase is visible in process listings/);
+  });
+
+  it('reads the passphrase from the environment', () => {
+    const { outDir } = build(SIMPLE);
+    const r = run(['verify', outDir, '--passphrase-env', 'VEIL_TEST_PASS', '--json'], {
+      env: { ...process.env, VEIL_TEST_PASS: PASS },
+    });
+    assert.equal(r.code, 0);
+    assert.equal(JSON.parse(r.stdout).checks.decryption.status, 'passed');
+    assert.equal(r.stderr, '');
+  });
+
+  it('reports a wrong passphrase as an unwrap failure, once', () => {
+    const { outDir } = build(SIMPLE);
+    const r = report([outDir, '--passphrase', 'wrong-passphrase']);
+    assert.equal(r.code, 1);
+    assert.equal(r.report.checks.decryption.status, 'failed');
+    assert.equal(find(r.report, 'mk_unwrap_failed').length, 1);
+    assert.equal(find(r.report, 'page_decrypt_failed').length, 0);
+  });
+
+  it('blames the individual page when only its ciphertext was altered', () => {
+    const { outDir } = build(SIMPLE);
+    const { generateWrapper } = require('./veil.js');
+    const page = path.join(outDir, 'blog', 'post.html');
+    const payload = extractPayload(fs.readFileSync(page, 'utf8'));
+    const ct = Buffer.from(payload.ct, 'base64');
+    ct[0] ^= 0xff;
+    payload.ct = ct.toString('base64');
+    fs.writeFileSync(page, generateWrapper(payload));
+    const r = report([outDir, '--passphrase', PASS]);
+    assert.equal(r.code, 1);
+    assert.equal(find(r.report, 'mk_unwrap_failed').length, 0);
+    assert.deepEqual(find(r.report, 'page_decrypt_failed').map((f) => f.path), ['blog/post.html']);
+  });
+
+  it('skips decryption when the pages in scope disagree on key material', () => {
+    const { outDir } = build(SIMPLE);
+    const other = build(SIMPLE);
+    fs.copyFileSync(path.join(other.outDir, 'index.html'), path.join(outDir, 'index.html'));
+    const r = report([outDir, '--passphrase', PASS]);
+    assert.equal(r.code, 1);
+    assert.equal(r.report.checks.decryption.status, 'skipped');
+    assert.match(r.report.checks.decryption.reason, /do not share one set of key material/);
+  });
+
+  it('exits 2 rather than auditing when a passphrase source is unusable', () => {
+    const { outDir } = build(SIMPLE);
+    const unset = verify([outDir, '--passphrase-env', 'VEIL_DEFINITELY_UNSET']);
+    assert.equal(unset.code, 2);
+    assert.match(unset.stderr, /is empty or not set/);
+
+    const both = verify([outDir, '--passphrase', PASS, '--passphrase-env', 'HOME']);
+    assert.equal(both.code, 2);
+    assert.match(both.stderr, /Use only one of/);
+
+    const empty = verify([outDir, '--passphrase', '']);
+    assert.equal(empty.code, 2);
+    assert.match(empty.stderr, /cannot be empty/);
+
+    const noTty = verify([outDir, '--prompt-passphrase']);
+    assert.equal(noTty.code, 2);
+    assert.match(noTty.stderr, /needs a terminal/);
+  });
+
+  // -- Chained protected zones ---------------------------------------------
+
+  it('audits one zone of a chained build without faulting the other', () => {
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><body>Home</body></html>',
+      'zone-a/secret.html': '<html><body>Zone A</body></html>',
+      'zone-b/secret.html': '<html><body>Zone B</body></html>',
+    });
+    const stage1 = fs.mkdtempSync(path.join(dir, 'chain1-'));
+    const stage2 = fs.mkdtempSync(path.join(dir, 'chain2-'));
+    assert.equal(run([
+      siteDir, stage1, '--passphrase', 'zone-a-pass', '--iterations', '100000',
+      '--id', 'zone-a', '--html-root', 'zone-a',
+    ]).code, 0);
+    assert.equal(run([
+      stage1, stage2, '--passphrase', 'zone-b-pass', '--iterations', '100000',
+      '--id', 'zone-b', '--html-root', 'zone-b',
+    ]).code, 0);
+
+    const b = report([stage2, '--html-root', 'zone-b', '--id', 'zone-b', '--passphrase', 'zone-b-pass']);
+    assert.equal(b.code, 0, JSON.stringify(b.report.findings));
+    assert.equal(b.report.stats.encryptedHtml, 1);
+    assert.equal(b.report.stats.outOfScopeWrappers, 1, "zone A's wrapper is not public HTML");
+    assert.deepEqual(b.report.publicHtml.map((p) => p.path), ['index.html']);
+    assert.equal(b.report.checks.decryption.status, 'passed');
+
+    const a = report([stage2, '--html-root', 'zone-a', '--id', 'zone-a', '--passphrase', 'zone-a-pass']);
+    assert.equal(a.code, 0, JSON.stringify(a.report.findings));
+    assert.equal(a.report.checks.decryption.status, 'passed');
+
+    // Correspondence for the second stage compares against that stage's input,
+    // where zone A's wrappers are ordinary passthrough files.
+    const withInput = report([stage2, '--input', stage1, '--html-root', 'zone-b', '--id', 'zone-b']);
+    assert.equal(withInput.code, 0, JSON.stringify(withInput.report.findings));
+    assert.equal(withInput.report.checks.correspondence.status, 'passed');
+  });
+
+  // -- End to end ----------------------------------------------------------
+
+  it('verifies a full build end to end with every stage enabled', () => {
+    const { siteDir, outDir } = build({
+      'index.html': '<html><body><h1>Home</h1></body></html>',
+      'docs/guide.html': '<html><body><h1>Guide</h1></body></html>',
+      'assets/logo.svg': '<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+    });
+    const r = run(['verify', outDir, '--input', siteDir, '--id', SITE_ID, '--passphrase-env', 'VEIL_TEST_PASS'], {
+      env: { ...process.env, VEIL_TEST_PASS: PASS },
+    });
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^correspondence: passed$/m);
+    assert.match(r.stdout, /^decryption: passed$/m);
+    assert.match(r.stdout, /^PASS/m);
+  });
+});

@@ -43,6 +43,7 @@ Veil’s value is a cleaner opinionated middle ground:
 - The runtime wrapper supports prompt-based unlock, shared site-wide unlock state, `sessionStorage` by default, optional persistent remember-device behavior, a lock button, and `?veil=logout`. It reports a clear error instead of hanging when Web Crypto is unavailable (non-secure context).
 - Public wrappers carry a constant "Protected page" title and a `noindex` robots meta; the wrapper's meta CSP survives `document.write` and therefore governs decrypted pages, blocking every `<script src>`.
 - The CLI supports `--passphrase-env`, `--id`, `--iterations`, `--remember`, `--html-root`, `--no-inline`, `--force`, `--version`, and `--help`. Parsing is strict (unknown options and missing values are fatal, not guessed), interactive passphrase entry is confirmed, and startup warnings cover `--passphrase` visibility, below-default iteration counts, and generic inferred site ids.
+- `veil verify <output-dir>` audits a built artifact. It is fail-closed (every HTML file in the audited scope must be a valid, current-format wrapper sealed for its own path, byte-identical to the wrapper Veil would generate for its payload), checks site-metadata consistency and IV uniqueness across the scope, and optionally adds correspondence checks against the input tree (`--input`) and a real decryption pass (`--passphrase-env`, `--prompt-passphrase`). Exit codes are 0/1/2 and `--json` emits a report with stable finding codes.
 - `veil.js` guards `main()` behind `require.main` and exports its pure/crypto/payload surface (`buildAad`, `generateSiteKeys`, `encryptPage`, `buildPayloadMeta`, `validatePayload`, `generateWrapper`, `extractPayload`, `decryptPayload`, the inlining helpers), so it can be required as a library and used for verification tooling.
 - Two test suites: the zero-dependency Node suite (`npm test`) and a dev-only Playwright browser suite (`npm run test:browser`) that exercises the real runtime — Web Crypto, `document.write`, the CSP, storage tiers, logout, and the unlock form. Playwright is a dev dependency only; the shipped artifact stays zero-dependency.
 - The tool has been exercised against a GitHub Pages-style subtree deployment.
@@ -51,7 +52,7 @@ Veil’s value is a cleaner opinionated middle ground:
 
 - Non-HTML assets remain public unless handled separately; only provably-unreachable inlined CSS/JS is dropped.
 - Multiple protected zones require chaining CLI invocations through successive output directories; there is no manifest/config mode yet.
-- There is no built-in local dev server or decrypt/inspect helper command, so verification is still a manual checklist.
+- There is no built-in local dev server or decrypt command; `veil verify` audits an artifact but never writes plaintext out, and the browser half of verification stays manual.
 - There is no published npm package; the exported library surface is a testability seam, not a committed public API.
 - Persistent unlock state still relies on browser storage, so any JS on the origin remains a meaningful risk.
 - Payload authentication binds a page to its path, but whole-tuple or whole-file substitution and rollback to an earlier build remain out of scope.
@@ -437,15 +438,15 @@ The current scope is intentionally narrow and opinionated:
 9. Support explicit logout.
 10. Support HTML-subtree protection inside a larger staged site.
 11. Ship as a zero-dependency single-file CLI.
+12. Audit a built artifact with `veil verify` before it is published.
 
 ## Near-Term Roadmap
 
-1. Add a `veil verify` command. Verification is currently a manual checklist
-   built out of `grep` and `node -e` against the exported payload helpers;
-   folding it into the CLI is the highest-value next step, since a wrong
-   `--html-root` silently publishes plaintext and nothing catches it today.
-2. Add a config or manifest mode so multiple protected zones can be declared in
+1. Add a config or manifest mode so multiple protected zones can be declared in
    one run instead of chained through successive output directories.
+2. Emit a build manifest recording every path Veil wrote and every asset it
+   deliberately omitted, so `veil verify --input` can classify a missing asset
+   exactly instead of warning that it might have been inlined.
 3. Improve local verification ergonomics further with something like
    `veil serve` and/or `veil decrypt`.
 4. Decide whether to publish a package in addition to the canonical single-file CLI.

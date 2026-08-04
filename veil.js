@@ -13,8 +13,10 @@ const crypto = require('crypto');
 function printHelp() {
   const usage = `
 Usage: veil <input-dir> <output-dir> [options]
+       veil verify <output-dir> [options]
 
 Encrypt a directory of HTML files for static hosting.
+Run "veil verify --help" for the audit subcommand.
 
 Options:
   --passphrase <pass>   Set passphrase (omit to prompt interactively)
@@ -53,7 +55,7 @@ function readVersion() {
  */
 function takeValue(args, i, flag) {
   const val = args[i];
-  if (val === undefined || val.startsWith('-')) fatal(`${flag} requires a value`);
+  if (val === undefined || val.startsWith('-')) throw new Error(`${flag} requires a value`);
   return val;
 }
 
@@ -186,9 +188,9 @@ const KEY_DEL = 127;
  * the passphrase. Every chunk is walked per code point, which also keeps
  * backspace from cutting an astral character (emoji, some CJK) in half.
  */
-function readHidden(promptText) {
+function readHidden(promptText, out = process.stdout) {
   return new Promise((resolve) => {
-    process.stdout.write(promptText);
+    out.write(promptText);
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
@@ -203,7 +205,7 @@ function readHidden(promptText) {
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdin.removeListener('data', onData);
-      process.stdout.write('\n');
+      out.write('\n');
       resolve(input);
     };
     const onData = (chunk) => {
@@ -215,7 +217,7 @@ function readHidden(promptText) {
           // Ctrl-C: hand the terminal back before dying, or the shell that
           // follows inherits a raw, echo-less tty.
           process.stdin.setRawMode(false);
-          process.stdout.write('\n');
+          out.write('\n');
           process.exit(1);
         }
         if (ch === '\n' || ch === '\r' || code === KEY_EOT) {
@@ -294,13 +296,29 @@ async function promptPassphrase() {
   return passphrase;
 }
 
+/**
+ * Read a passphrase that will be checked against existing ciphertext.
+ *
+ * No confirmation: authentication is the confirmation — a typo fails to
+ * decrypt and says so. The prompt goes to stderr so `--json` keeps stdout to
+ * the report alone.
+ */
+function promptVerificationPassphrase() {
+  return readHidden('Passphrase: ', process.stderr);
+}
+
+/**
+ * Normalize a --html-root value. Throws rather than exiting: the encrypt path
+ * turns this into the same fatal error through main()'s catch, and verify maps
+ * it to its own "audit could not be performed" exit code.
+ */
 function normalizeHtmlRoot(root) {
   const normalized = path.normalize(root);
   if (path.isAbsolute(normalized)) {
-    fatal(`--html-root must be relative to the input directory: ${root}`);
+    throw new Error(`--html-root must be relative, not absolute: ${root}`);
   }
   if (normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
-    fatal(`--html-root cannot escape the input directory: ${root}`);
+    throw new Error(`--html-root cannot escape the directory it names: ${root}`);
   }
   return normalized === '.' ? '.' : normalized.replace(new RegExp(`${escapeRegExp(path.sep)}+$`), '');
 }
@@ -1136,21 +1154,33 @@ function decryptPayload(payload, passphrase) {
   if (errors.length > 0) {
     throw new Error(`invalid payload: ${errors.join('; ')}`);
   }
-  const wrapAad = buildAad(payload.v, payload.siteId, 'wrap');
-  const pageAad = buildAad(payload.v, payload.siteId, 'page', payload.path);
-  const salt = Buffer.from(payload.salt, 'base64');
+  return decryptPageWithMk(payload, unwrapMk(payload, passphrase));
+}
 
-  // Derive the KEK from the passphrase
-  const kek = crypto.pbkdf2Sync(passphrase, salt, payload.iterations, 32, 'sha256');
-
-  // Unwrap the master key (32-byte key followed by its 16-byte auth tag)
+/**
+ * Derive the KEK from the passphrase and unwrap the site master key.
+ *
+ * Split out from decryptPayload because PBKDF2 is the entire cost of a
+ * decryption: every page of one build shares this master key, so a caller
+ * checking a whole site derives once and decrypts each page with the result.
+ * Throws when the passphrase is wrong or the wrap metadata was tampered with;
+ * the two are indistinguishable by design.
+ */
+function unwrapMk(payload, passphrase) {
+  const kek = crypto.pbkdf2Sync(
+    passphrase, Buffer.from(payload.salt, 'base64'), payload.iterations, 32, 'sha256'
+  );
+  // The wrapped key is a 32-byte key followed by its 16-byte auth tag.
   const wrapped = Buffer.from(payload.wrappedMk, 'base64');
   const unwrap = crypto.createDecipheriv('aes-256-gcm', kek, Buffer.from(payload.wrapIv, 'base64'));
-  unwrap.setAAD(wrapAad);
+  unwrap.setAAD(buildAad(payload.v, payload.siteId, 'wrap'));
   unwrap.setAuthTag(wrapped.subarray(32));
-  const mk = Buffer.concat([unwrap.update(wrapped.subarray(0, 32)), unwrap.final()]);
+  return Buffer.concat([unwrap.update(wrapped.subarray(0, 32)), unwrap.final()]);
+}
 
-  // Decrypt the page with the master key
+/** Decrypt one page with an already-unwrapped master key. */
+function decryptPageWithMk(payload, mk) {
+  const pageAad = buildAad(payload.v, payload.siteId, 'page', payload.path);
   const ct = Buffer.from(payload.ct, 'base64');
   const decipher = crypto.createDecipheriv('aes-256-gcm', mk, Buffer.from(payload.iv, 'base64'));
   decipher.setAAD(pageAad);
@@ -1436,6 +1466,61 @@ function extractPayload(wrapperHtml) {
   }
 }
 
+const PAYLOAD_RE_G = new RegExp(PAYLOAD_RE.source, 'g');
+
+/** Exactly how generateWrapper opens the payload script. */
+const PAYLOAD_SCRIPT_OPEN = '<script id="veil-payload" type="application/json">';
+
+/**
+ * Classify a page the way an auditor needs to see it, which is finer than
+ * extractPayload's null: a page with no payload at all is public content,
+ * while a page that carries Veil's payload script but yields no readable
+ * payload is a damaged wrapper. Reporting both as "not a wrapper" would let a
+ * mangled protected page pass as an intentionally public one.
+ *
+ * Both tests run against the raw text, in this order, on purpose. A payload
+ * script is found by the exact pattern Veil writes, so no amount of markup
+ * added around it — a comment that a browser and a tokenizer disagree about,
+ * say — can hide a payload that is still there. Only when no payload is
+ * readable does the opening tag alone decide, and it is Veil's own spelling of
+ * that tag, which cannot occur in prose about Veil because prose escapes `<`.
+ *
+ * What this deliberately does *not* attempt is to recognize a wrapper whose
+ * payload script was renamed or restructured. Deciding whether such a page is
+ * "really" a wrapper means reproducing a browser's HTML parsing exactly, and
+ * losing that race fails open. The guarantee is placed elsewhere instead:
+ * every page *in scope* must equal the wrapper Veil generates for its payload,
+ * and each protected zone is audited by its own verify run — so a damaged
+ * wrapper is caught by the run that owns it, not by a heuristic in another.
+ *
+ * @returns {{kind: 'absent'|'malformed'|'parsed', payload: object|null, reason: string|null}}
+ */
+function inspectPayload(wrapperHtml) {
+  const absent = { kind: 'absent', payload: null, reason: null };
+  const malformed = (reason) => ({ kind: 'malformed', payload: null, reason });
+  const matches = [...wrapperHtml.matchAll(PAYLOAD_RE_G)];
+  if (matches.length === 0) {
+    return wrapperHtml.includes(PAYLOAD_SCRIPT_OPEN)
+      ? malformed('opens a veil-payload script that has no readable contents')
+      : absent;
+  }
+  // Two payload scripts mean the runtime and the auditor could read different
+  // metadata: the wrapper's own template emits exactly one.
+  if (matches.length > 1) {
+    return malformed(`carries ${matches.length} veil-payload scripts`);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(matches[0][1]);
+  } catch {
+    return malformed('payload script is not valid JSON');
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return malformed('payload is not a JSON object');
+  }
+  return { kind: 'parsed', payload, reason: null };
+}
+
 // ---------------------------------------------------------------------------
 // File system helpers
 // ---------------------------------------------------------------------------
@@ -1451,30 +1536,50 @@ function isJsFile(name) {
 }
 
 /**
- * Recursively collect all files under dir, returning paths relative to dir.
- * Symlinks and special files are rejected: silently skipping them (the old
- * behavior) made files vanish from builds, and following them would need
- * cycle handling and escape checks. Rejecting is the simple, safe policy.
+ * Reject anything that is not a regular file or directory. Symlinks and
+ * special files are never walked: silently skipping them (the old behavior)
+ * made files vanish from builds, and following them would need cycle handling
+ * and escape checks. Rejecting is the simple, safe policy.
  */
-function walkDir(dir, relBase = '') {
-  const results = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    const rel = path.join(relBase, entry.name);
-    if (entry.isSymbolicLink()) {
-      fatal(
-        `symbolic link in input directory: ${rel}\n` +
-        'Veil does not follow symlinks. Replace it with a regular file or directory.'
-      );
-    } else if (entry.isDirectory()) {
-      results.push(...walkDir(full, rel));
-    } else if (entry.isFile()) {
-      results.push(rel);
-    } else {
-      fatal(`unsupported file type in input directory: ${rel}`);
-    }
+function refuseIrregular(rel, kind) {
+  if (kind === 'symbolic link') {
+    throw new Error(
+      `symbolic link in input directory: ${rel}\n` +
+      'Veil does not follow symlinks. Replace it with a regular file or directory.'
+    );
   }
+  throw new Error(`unsupported file type in input directory: ${rel}`);
+}
+
+/**
+ * Recursively collect all files under dir, returning paths relative to dir in
+ * a deterministic order.
+ *
+ * `onIrregular(rel, kind)` decides what a symlink or special file means. The
+ * default refuses the whole walk, which is right for a build; verify passes a
+ * collector so one bad entry becomes a finding instead of ending the audit.
+ */
+function walkDir(dir, options = {}) {
+  const onIrregular = options.onIrregular || refuseIrregular;
+  const results = [];
+  const walk = (current, relBase) => {
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      const rel = path.join(relBase, entry.name);
+      if (entry.isSymbolicLink()) {
+        onIrregular(rel, 'symbolic link');
+      } else if (entry.isDirectory()) {
+        walk(full, rel);
+      } else if (entry.isFile()) {
+        results.push(rel);
+      } else {
+        onIrregular(rel, 'unsupported file type');
+      }
+    }
+  };
+  walk(dir, '');
   return results;
 }
 
@@ -1588,10 +1693,615 @@ function publishOutput(stagingDir, outputDir, force) {
 }
 
 // ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+function printVerifyHelp() {
+  const usage = `
+Usage: veil verify <output-dir> [options]
+
+Audit a built output directory: every HTML file in the audited scope must be a
+valid, current-format Veil wrapper sealed for the path it sits at.
+
+Options:
+  --html-root <dir>     Audit only this output-relative dir (repeatable)
+  --input <dir>         Compare against the input directory this build was made from
+  --id <site-id>        Require this exact site id
+  --passphrase <pass>   Verify decryption with this passphrase
+  --passphrase-env <n>  Verify decryption with the passphrase in env variable <n>
+  --prompt-passphrase   Verify decryption with a passphrase typed at the terminal
+  --json                Emit the report as JSON
+  --help                Show this help
+
+Without --html-root every HTML file in the output must be encrypted; with it,
+HTML outside those roots is reported as public rather than treated as a failure.
+Decryption is only checked when a passphrase is supplied.
+
+Exit codes:
+  0   the audit ran and found no errors
+  1   the audit ran and found errors
+  2   the audit could not be performed
+`.trim();
+  console.log(usage);
+}
+
+/** Report every path in posix form, so a report reads the same on any platform. */
+function toPosix(rel) {
+  return rel.split(path.sep).join('/');
+}
+
+/** Deterministic string order, independent of locale. */
+function compareStrings(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// Payload metadata written once per build and shared by every page of it.
+const SHARED_PAYLOAD_FIELDS = ['v', 'siteId', 'salt', 'iterations', 'wrappedMk', 'wrapIv', 'remember'];
+
+// The subset that actually determines the master key and the AAD it is sealed
+// under. Grouping pages for IV uniqueness and for the decryption pass uses
+// this, not the whole shared tuple: `remember` is a UI default, so a build
+// that disagrees about it is inconsistent but still one key's worth of pages.
+const KEY_MATERIAL_FIELDS = ['v', 'siteId', 'salt', 'iterations', 'wrappedMk', 'wrapIv'];
+
+// Findings produced only by the correspondence stage, used to report its
+// status. `irregular_file` and `unreadable_file` belong here too, but only
+// when they arose from the input tree or from a comparison — the same codes
+// occur while reading output HTML, which says nothing about correspondence —
+// so those are flagged where they are raised rather than matched by code.
+const CORRESPONDENCE_CODES = new Set([
+  'missing_output', 'missing_asset', 'orphan', 'passthrough_modified',
+]);
+
+function parseVerifyArgs(args) {
+  const opts = {
+    outputDir: null,
+    inputDir: null,
+    htmlRoots: [],
+    siteId: null,
+    passphrase: null,
+    passphraseEnv: null,
+    promptPassphrase: false,
+    json: false,
+  };
+  const positional = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--help' || arg === '-h') {
+      printVerifyHelp();
+      process.exit(0);
+    } else if (arg === '--input') {
+      opts.inputDir = path.resolve(takeValue(args, ++i, '--input'));
+    } else if (arg === '--html-root') {
+      opts.htmlRoots.push(normalizeHtmlRoot(takeValue(args, ++i, '--html-root')));
+    } else if (arg === '--id') {
+      opts.siteId = takeValue(args, ++i, '--id');
+      if (opts.siteId === '') throw new Error('--id must not be empty');
+    } else if (arg === '--passphrase') {
+      opts.passphrase = takeValue(args, ++i, '--passphrase');
+    } else if (arg === '--passphrase-env') {
+      opts.passphraseEnv = takeValue(args, ++i, '--passphrase-env');
+    } else if (arg === '--prompt-passphrase') {
+      opts.promptPassphrase = true;
+    } else if (arg === '--json') {
+      opts.json = true;
+    } else if (arg.startsWith('-')) {
+      throw new Error(`Unknown option: ${arg}`);
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  if (positional.length === 0) {
+    throw new Error('verify requires an output directory\nUsage: veil verify <output-dir> [options]');
+  }
+  if (positional.length > 1) {
+    throw new Error(`Unexpected argument: ${positional[1]}`);
+  }
+  opts.outputDir = path.resolve(positional[0]);
+  return opts;
+}
+
+/**
+ * Resolve the passphrase for the decryption stage, or null to skip it.
+ *
+ * Exactly one source, and never an implicit one: a missing passphrase means
+ * "skip decryption", so it must not also mean "prompt", or an automated run
+ * with no passphrase would block on a terminal that is not there.
+ */
+async function resolveVerifyPassphrase(opts) {
+  const given = [opts.passphrase !== null, opts.passphraseEnv !== null, opts.promptPassphrase];
+  if (given.filter(Boolean).length > 1) {
+    throw new Error('Use only one of --passphrase, --passphrase-env, or --prompt-passphrase');
+  }
+  if (opts.passphrase !== null) {
+    if (opts.passphrase === '') throw new Error('Passphrase cannot be empty');
+    warn('--passphrase is visible in process listings and shell history — prefer --passphrase-env or --prompt-passphrase');
+    return opts.passphrase;
+  }
+  if (opts.passphraseEnv !== null) {
+    const value = process.env[opts.passphraseEnv] || '';
+    if (!value) throw new Error(`Environment variable ${opts.passphraseEnv} is empty or not set`);
+    return value;
+  }
+  if (opts.promptPassphrase) {
+    if (!process.stdin.isTTY) {
+      throw new Error('--prompt-passphrase needs a terminal; use --passphrase-env in scripts');
+    }
+    const value = await promptVerificationPassphrase();
+    if (!value) throw new Error('Passphrase cannot be empty');
+    return value;
+  }
+  return null;
+}
+
+/**
+ * Audit an output directory and return a structured report.
+ *
+ * Inside the scope named by --html-root, every HTML file must be a canonical
+ * wrapper — parseable, valid, current-format, sealed for the path it sits at,
+ * and byte-identical to what generateWrapper produces for its payload — and
+ * the scope as a whole must agree on its site id, shared metadata, and IV
+ * uniqueness, and must decrypt when a passphrase is supplied. Anything short
+ * of that is an error.
+ *
+ * Outside that scope only one thing is decidable: a page whose bytes equal
+ * generateWrapper(payload) is certainly a wrapper, and is checked as one.
+ * Every other payload-looking page is warned about and listed as public,
+ * because a damaged wrapper and a public page quoting wrapper markup in a
+ * script, comment, or code sample are the same bytes to anything short of a
+ * real HTML parser. A chained artifact is therefore audited once per zone:
+ * each run is what turns that warning into an error for its own pages.
+ *
+ * Throws only when the audit cannot be performed at all; everything it can
+ * assess becomes a finding.
+ */
+function verifyCommand(opts, passphrase) {
+  const findings = [];
+  const add = (severity, code, message, file = null) => {
+    findings.push({ severity, code, path: file, message });
+  };
+  // Set by anything that leaves the input/output comparison incomplete, so the
+  // stage can never report "passed" over a tree it could not fully read.
+  let correspondenceIncomplete = false;
+
+  const requireDir = (dir, tree) => {
+    let st;
+    try {
+      st = fs.statSync(dir);
+    } catch {
+      throw new Error(`${tree} directory does not exist: ${dir}`);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`${tree} path is not a directory: ${dir}`);
+    }
+  };
+
+  requireDir(opts.outputDir, 'output');
+  if (opts.inputDir !== null) {
+    requireDir(opts.inputDir, 'input');
+    // Comparing a build against itself makes every correspondence check
+    // vacuously pass, which is worse than not running them: the report would
+    // claim the stage passed. Veil can never build one tree from the other,
+    // so any overlap is a mistyped path, not a layout to support.
+    const realOut = fs.realpathSync(opts.outputDir);
+    const realIn = fs.realpathSync(opts.inputDir);
+    const contains = (a, b) => {
+      const rel = path.relative(a, b);
+      return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+    };
+    if (contains(realIn, realOut) || contains(realOut, realIn)) {
+      throw new Error(
+        '--input must name a separate tree from the output directory\n' +
+        'Comparing a build against itself proves nothing about it.'
+      );
+    }
+  }
+
+  const readTree = (dir, tree) => {
+    return walkDir(dir, {
+      onIrregular: (rel, kind) => {
+        // An entry the walk had to skip is a hole in the file set being
+        // compared, whichever tree it was in: a skipped output entry never
+        // reaches the orphan check, a skipped input entry never reaches the
+        // missing-file check.
+        correspondenceIncomplete = true;
+        add(
+          'error', 'irregular_file',
+          `is a ${kind} in the ${tree} tree — Veil never emits one, and its contents are not audited`,
+          toPosix(rel)
+        );
+      },
+    });
+  };
+
+  const outputFiles = readTree(opts.outputDir, 'output');
+  const inputFiles = opts.inputDir === null ? null : readTree(opts.inputDir, 'input');
+  const inScope = (rel) => shouldEncryptHtml(rel, opts.htmlRoots);
+
+  // -- Wrapper hygiene, and the cohort it yields ---------------------------
+
+  const outputHtml = outputFiles.filter(isHtmlFile);
+  const publicHtml = [];   // HTML reported as public: { path, allowed }
+  const cohort = [];       // in-scope, current-format wrappers: { rel, path, payload }
+  let outOfScopeWrappers = 0;
+
+  for (const rel of outputHtml) {
+    const posix = toPosix(rel);
+    const scoped = inScope(rel);
+    let html;
+    try {
+      html = fs.readFileSync(path.join(opts.outputDir, rel), 'utf8');
+    } catch (err) {
+      add('error', 'unreadable_file', `could not be read: ${err.message}`, posix);
+      continue;
+    }
+
+    // Anything payload-shaped that is not a canonical wrapper — unreadable,
+    // invalid, the wrong format version, or simply not byte-identical — is
+    // only decidable inside the audited scope. Outside it, the same bytes are
+    // equally a damaged wrapper or ordinary public HTML quoting wrapper markup
+    // in a script, a comment, or a code sample; telling those apart needs a
+    // real HTML parser, and guessing would fail a legitimate public page. So
+    // out of scope it is reported, not failed: the run that owns it decides.
+    const undecidable = (code, message) => {
+      if (scoped) {
+        add('error', code, message, posix);
+        return;
+      }
+      add(
+        'warning', code,
+        `${message} — outside the audited roots this may equally be public HTML quoting wrapper markup; verify the zone that owns it`,
+        posix
+      );
+      publicHtml.push({ path: posix, allowed: true });
+    };
+
+    const found = inspectPayload(html);
+    if (found.kind === 'absent') {
+      publicHtml.push({ path: posix, allowed: !scoped });
+      if (scoped) {
+        add('error', 'html_not_encrypted', 'carries no Veil payload — it is published as plaintext', posix);
+      }
+      continue;
+    }
+    if (found.kind === 'malformed') {
+      undecidable('payload_malformed', found.reason);
+      continue;
+    }
+
+    const payload = found.payload;
+    const schemaErrors = validatePayload(payload);
+    if (schemaErrors.length > 0) {
+      undecidable('payload_invalid', `has an invalid payload: ${schemaErrors.join('; ')}`);
+      continue;
+    }
+    if (payload.v !== FORMAT_VERSION) {
+      undecidable(
+        'payload_version_unsupported',
+        payload.v < FORMAT_VERSION
+          ? `is format v${payload.v}; this Veil writes v${FORMAT_VERSION} and cannot certify an older wrapper — re-encrypt the source`
+          : `is format v${payload.v}; this Veil only understands v${FORMAT_VERSION} — upgrade veil.js to audit it`
+      );
+      continue;
+    }
+    // The wrapper is a security boundary in its own right: its CSP, its
+    // storage handling, and its runtime all live in the shell around the
+    // payload. Regenerating it from the payload it carries is the cheapest
+    // complete check that none of that was touched — and equality is also the
+    // only proof that a page *is* a wrapper, since a schema-valid payload can
+    // be quoted verbatim by a public page inside a textarea or a comment,
+    // where a browser creates no payload element at all.
+    const canonical = html === generateWrapper(payload);
+    if (!canonical) {
+      undecidable(
+        'wrapper_modified',
+        'does not match the wrapper Veil generates for its own payload — it was edited, minified, or tampered with after the build'
+      );
+    }
+    // A canonical wrapper is unambiguous wherever it sits, so a path it was
+    // not sealed for is an error even out of scope.
+    if (payload.path !== posix && (scoped || canonical)) {
+      add(
+        'error', 'payload_path_mismatch',
+        `is sealed for "${payload.path}" — the wrapper was moved or renamed after the build`,
+        posix
+      );
+    }
+
+    if (scoped) cohort.push({ rel, path: posix, payload });
+    else if (canonical) outOfScopeWrappers++;
+  }
+
+  if (outputHtml.filter(inScope).length === 0) {
+    add(
+      'error', 'no_encrypted_pages',
+      opts.htmlRoots.length > 0
+        ? `no HTML files under ${opts.htmlRoots.map(toPosix).join(', ')} — nothing was verified`
+        : 'no HTML files in the output directory — nothing was verified'
+    );
+  }
+
+  // -- Cohort checks --------------------------------------------------------
+
+  if (opts.siteId !== null) {
+    const wrong = new Map();
+    for (const page of cohort) {
+      if (page.payload.siteId === opts.siteId) continue;
+      if (!wrong.has(page.payload.siteId)) wrong.set(page.payload.siteId, []);
+      wrong.get(page.payload.siteId).push(page.path);
+    }
+    for (const [id, paths] of wrong) {
+      add(
+        'error', 'site_id_mismatch',
+        `carries site id "${id}", not the expected "${opts.siteId}" (${paths.length} page(s) in scope)`,
+        paths[0]
+      );
+    }
+  }
+
+  if (cohort.length > 1) {
+    const ref = cohort[0];
+    for (const page of cohort.slice(1)) {
+      for (const field of SHARED_PAYLOAD_FIELDS) {
+        if (page.payload[field] !== ref.payload[field]) {
+          add(
+            'error', 'site_inconsistent',
+            `has a different ${field} than ${ref.path} — these pages came from different builds`,
+            page.path
+          );
+        }
+      }
+    }
+  }
+
+  // IV uniqueness only means anything among pages sealed with the same master
+  // key, so pages are grouped by their whole shared tuple first: an
+  // inconsistent build would otherwise report a false key-reuse catastrophe.
+  const keyGroups = new Map();
+  for (const page of cohort) {
+    const key = JSON.stringify(KEY_MATERIAL_FIELDS.map((f) => page.payload[f]));
+    if (!keyGroups.has(key)) keyGroups.set(key, new Map());
+    const seenIvs = keyGroups.get(key);
+    if (seenIvs.has(page.payload.iv)) {
+      add(
+        'error', 'iv_reuse',
+        `reuses the IV of ${seenIvs.get(page.payload.iv)} under the same master key — AES-GCM leaks both plaintexts`,
+        page.path
+      );
+    } else {
+      seenIvs.set(page.payload.iv, page.path);
+    }
+  }
+
+  const weak = cohort.filter((p) => p.payload.iterations < DEFAULT_ITERATIONS);
+  if (weak.length > 0) {
+    add(
+      'warning', 'iterations_below_default',
+      `${weak[0].payload.iterations} PBKDF2 iterations is below the default ${DEFAULT_ITERATIONS} — weaker against offline guessing (${weak.length} page(s))`
+    );
+  }
+
+  // -- Correspondence with the input tree ----------------------------------
+
+  if (inputFiles !== null) {
+    const inputSet = new Set(inputFiles);
+    const outputSet = new Set(outputFiles);
+    // Only in-scope HTML is generated by this build; everything else that
+    // reaches the output — assets, public HTML, and wrappers from an earlier
+    // zone of a chained build — is passed through and must survive intact.
+    const generated = new Set(inputFiles.filter((rel) => isHtmlFile(rel) && inScope(rel)));
+
+    for (const rel of inputFiles) {
+      const posix = toPosix(rel);
+      if (!outputSet.has(rel)) {
+        if (isHtmlFile(rel)) {
+          add('error', 'missing_output', 'is in the input tree but absent from the output', posix);
+        } else {
+          add(
+            'warning', 'missing_asset',
+            'is in the input tree but absent from the output — expected when its contents were inlined into encrypted pages',
+            posix
+          );
+        }
+        continue;
+      }
+      if (generated.has(rel)) continue;
+      let identical;
+      try {
+        const src = path.join(opts.inputDir, rel);
+        const dest = path.join(opts.outputDir, rel);
+        identical = fs.statSync(src).size === fs.statSync(dest).size &&
+          fs.readFileSync(src).equals(fs.readFileSync(dest));
+      } catch (err) {
+        correspondenceIncomplete = true;
+        add('error', 'unreadable_file', `could not be compared: ${err.message}`, posix);
+        continue;
+      }
+      if (!identical) {
+        add('error', 'passthrough_modified', 'differs from the input file it was copied from', posix);
+      }
+    }
+
+    for (const rel of outputFiles) {
+      if (!inputSet.has(rel)) {
+        add('error', 'orphan', 'is in the output but not in the input tree — a stale file from an earlier build', toPosix(rel));
+      }
+    }
+  }
+
+  // Each root is checked on its own: the union matching something would let a
+  // second, mistyped root pass unnoticed.
+  const rootTree = inputFiles === null ? outputFiles : inputFiles;
+  const rootTreeName = inputFiles === null ? 'output' : 'input';
+  for (const root of opts.htmlRoots) {
+    if (!rootTree.some((rel) => isHtmlFile(rel) && shouldEncryptHtml(rel, [root]))) {
+      add(
+        'error', 'html_root_unmatched',
+        `--html-root ${toPosix(root)} matches no HTML file in the ${rootTreeName} tree`
+      );
+    }
+  }
+
+  // -- Decryption -----------------------------------------------------------
+
+  let decryption = { status: 'skipped', reason: 'no passphrase supplied' };
+  if (passphrase !== null) {
+    const keyMaterial = new Set(keyGroups.keys());
+    if (cohort.length === 0) {
+      decryption = { status: 'skipped', reason: 'no verifiable encrypted pages in scope' };
+    } else if (keyMaterial.size > 1) {
+      decryption = { status: 'skipped', reason: 'pages in scope do not share one set of key material' };
+    } else {
+      let mk = null;
+      try {
+        mk = unwrapMk(cohort[0].payload, passphrase);
+      } catch {
+        add(
+          'error', 'mk_unwrap_failed',
+          'the master key did not unwrap — the passphrase is wrong, or the key metadata was tampered with'
+        );
+      }
+      if (mk === null) {
+        decryption = { status: 'failed', reason: null };
+      } else {
+        let failed = 0;
+        for (const page of cohort) {
+          try {
+            decryptPageWithMk(page.payload, mk);
+          } catch {
+            failed++;
+            add(
+              'error', 'page_decrypt_failed',
+              'did not decrypt under the site master key — its ciphertext, IV, or sealed metadata was altered',
+              page.path
+            );
+          }
+        }
+        decryption = { status: failed > 0 ? 'failed' : 'passed', reason: null };
+      }
+    }
+  }
+
+  // -- Report ---------------------------------------------------------------
+
+  const severityRank = { error: 0, warning: 1 };
+  findings.sort((a, b) =>
+    severityRank[a.severity] - severityRank[b.severity] ||
+    compareStrings(a.path || '', b.path || '') ||
+    compareStrings(a.code, b.code) ||
+    compareStrings(a.message, b.message)
+  );
+  publicHtml.sort((a, b) => compareStrings(a.path, b.path));
+
+  const errors = findings.filter((f) => f.severity === 'error').length;
+  const warnings = findings.length - errors;
+  const correspondenceFailed = correspondenceIncomplete || findings.some(
+    (f) => f.severity === 'error' && CORRESPONDENCE_CODES.has(f.code)
+  );
+
+  return {
+    reportVersion: 1,
+    ok: errors === 0,
+    outputDir: opts.outputDir,
+    inputDir: opts.inputDir,
+    scope: { htmlRoots: opts.htmlRoots.map(toPosix), siteId: opts.siteId },
+    stats: {
+      files: outputFiles.length,
+      encryptedHtml: cohort.length,
+      publicHtml: publicHtml.filter((p) => p.allowed).length,
+      outOfScopeWrappers,
+    },
+    publicHtml,
+    checks: {
+      correspondence: inputFiles === null
+        ? { status: 'skipped', reason: 'no --input directory supplied' }
+        : { status: correspondenceFailed ? 'failed' : 'passed', reason: null },
+      decryption,
+    },
+    findings,
+    counts: { errors, warnings },
+  };
+}
+
+/** Render a report for a human reader. */
+function formatVerifyReport(report) {
+  const lines = [`veil verify: ${report.outputDir}`];
+  const roots = report.scope.htmlRoots.length > 0 ? report.scope.htmlRoots.join(', ') : 'whole output';
+  lines.push(`  scope: ${roots}${report.scope.siteId === null ? '' : ` (site id: ${report.scope.siteId})`}`);
+  if (report.inputDir !== null) lines.push(`  input: ${report.inputDir}`);
+
+  const s = report.stats;
+  lines.push('');
+  lines.push(
+    `${s.files} file(s), ${s.encryptedHtml} encrypted page(s) in scope, ` +
+    `${s.publicHtml} public HTML file(s), ${s.outOfScopeWrappers} wrapper(s) outside scope`
+  );
+
+  const allowedPublic = report.publicHtml.filter((p) => p.allowed);
+  if (allowedPublic.length > 0) {
+    lines.push('');
+    lines.push('Public HTML (outside the audited roots — served as plaintext):');
+    for (const p of allowedPublic) lines.push(`  ${p.path}`);
+  }
+
+  for (const severity of ['error', 'warning']) {
+    const group = report.findings.filter((f) => f.severity === severity);
+    if (group.length === 0) continue;
+    lines.push('');
+    lines.push(`${severity === 'error' ? 'Errors' : 'Warnings'}:`);
+    for (const f of group) {
+      lines.push(`  [${f.code}] ${f.path === null ? f.message : `${f.path} ${f.message}`}`);
+    }
+  }
+
+  lines.push('');
+  for (const [name, check] of Object.entries(report.checks)) {
+    lines.push(`${name}: ${check.status}${check.reason === null ? '' : ` (${check.reason})`}`);
+  }
+
+  const { errors, warnings } = report.counts;
+  lines.push('');
+  lines.push(
+    report.ok
+      ? `PASS${warnings > 0 ? ` (${warnings} warning(s))` : ''}`
+      : `FAIL (${errors} error(s)${warnings > 0 ? `, ${warnings} warning(s)` : ''})`
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Run the verify subcommand. Returns the process exit code rather than
+ * exiting, so stdout is never truncated mid-report: 0 clean, 1 errors found,
+ * 2 the audit could not be performed at all.
+ */
+async function runVerify(args) {
+  try {
+    const opts = parseVerifyArgs(args);
+    const passphrase = await resolveVerifyPassphrase(opts);
+    const report = verifyCommand(opts, passphrase);
+    console.log(opts.json ? JSON.stringify(report, null, 2) : formatVerifyReport(report));
+    return report.counts.errors > 0 ? 1 : 0;
+  } catch (err) {
+    console.error(`veil: ${err && err.message ? err.message : String(err)}`);
+    return 2;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // The verify subcommand is dispatched before the encrypt parser so that
+  // parser keeps its two-positional shape. An input directory actually named
+  // "verify" is still addressable as ./verify.
+  if (process.argv[2] === 'verify') {
+    process.exitCode = await runVerify(process.argv.slice(3));
+    return;
+  }
+
   const opts = parseArgs(process.argv);
 
   emitStartupWarnings(opts);

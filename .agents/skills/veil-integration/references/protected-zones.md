@@ -222,36 +222,48 @@ before checking the browser.
 
 **In `./_encrypted` (the final stage only):**
 
+Run `veil verify` once per zone, naming that zone's root, id, and passphrase.
+Wrappers belonging to the *other* zones are reported as out of scope rather
+than as failures, so each run audits exactly one zone:
+
 ```bash
-# 1. Which HTML is served in the clear? Every path printed must be intended.
-#    Expect exactly the public pages — plus nothing else.
-grep -rL --include='*.[Hh][Tt][Mm][Ll]' --include='*.[Hh][Tt][Mm]' 'id="veil-payload"' ./_encrypted
+node ./tools/veil.js verify ./_encrypted \
+  --html-root client-a --id client-a --passphrase-env ZONE_A_PASS
 
-# 2. Which zone owns each protected page? Site ids must match the --id per zone.
-node -e '
-const fs = require("fs"), path = require("path");
-const { extractPayload, isHtmlFile } = require("./tools/veil.js");
-const walk = (d) => fs.readdirSync(d, { withFileTypes: true })
-  .flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
-for (const f of walk(process.argv[1]).filter(isHtmlFile)) {
-  const p = extractPayload(fs.readFileSync(f, "utf8"));
-  console.log(f.padEnd(40), p ? `PROTECTED id=${p.siteId} path=${p.path}` : "PUBLIC");
-}' ./_encrypted
-
-# 3. Canaries: one per zone, from different source pages. All must print "ok".
-for s in "Zone A heading" "Zone A report caption" "Zone B heading"; do
-  grep -rq "$s" ./_encrypted && echo "LEAK: $s" || echo "ok: $s"
-done
-
-# 4. Control: a string from a public page must still be findable. If it is
-#    not, grep is matching nothing and steps 1-3 proved nothing.
-grep -rq "Public landing heading" ./_encrypted && echo "ok: control found"
+node ./tools/veil.js verify ./_encrypted \
+  --html-root client-b --id client-b --passphrase-env ZONE_B_PASS
 ```
 
-Expected shape for the layout above: `index.html` and `about.html` print
-`PUBLIC`; `client-a/*` print `id=client-a`; `client-b/*` print `id=client-b`.
-If any `client-a/*` page comes back `PUBLIC`, the second stage overwrote the
-first — check for a shared output directory and a stray `--force`.
+Each run prints the HTML that is served in the clear:
+
+```text
+Public HTML (outside the audited roots — served as plaintext):
+  about.html
+  index.html
+```
+
+For the layout above that list must be exactly `index.html` and `about.html`,
+and `outOfScopeWrappers` must account for the other zone's pages. If a
+`client-a/*` page shows up as public, the second stage overwrote the first —
+check for a shared output directory and a stray `--force`.
+
+**Run every zone.** Inside the audited roots a page must be a canonical
+wrapper or the audit fails. Outside them Veil does not guess: only a page whose
+bytes exactly equal a generated wrapper counts as one and lands in
+`outOfScopeWrappers`. Every other payload-looking page — a wrapper that was
+edited or minified, but equally a public page quoting a payload in a
+`<textarea>` or code sample — is warned about and listed as public, because
+separating those needs a real HTML parser. So a tampered wrapper is caught by
+*its own* zone's run: verifying only one zone of a chained artifact is not a
+complete audit.
+
+Correspondence checks compare a stage against *its own* input, so pass the
+previous stage's directory, not the original source tree:
+
+```bash
+node ./tools/veil.js verify ./_encrypted --input ./_stage1 \
+  --html-root client-b --id client-b
+```
 
 **In a real browser** (`python3 -m http.server 8765 --directory ./_encrypted`,
 or over HTTPS once deployed — Web Crypto needs a secure context):

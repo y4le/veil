@@ -97,21 +97,18 @@ jobs:
         env:
           VEIL_PASSPHRASE: ${{ secrets.VEIL_PASSPHRASE }}
 
-      - name: Assert every page is encrypted
-        # Uses Veil's own classifier and payload parser rather than a grep
-        # marker: catches any-case extensions and invalid payloads alike.
+      - name: Verify the encrypted output
+        # Fail-closed audit: every HTML file must be a valid, current-format
+        # wrapper sealed for its own path, no unexpected or modified files,
+        # and the ciphertext must actually decrypt. Exit 1 on findings, 2 if
+        # the audit itself cannot run.
         run: |
-          node -e '
-            const fs = require("fs"), path = require("path");
-            const { isHtmlFile, extractPayload, validatePayload } = require("./tools/veil.js");
-            const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) =>
-              e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
-            const bad = walk("./_encrypted").filter(isHtmlFile).filter((f) => {
-              const p = extractPayload(fs.readFileSync(f, "utf8"));
-              return !p || validatePayload(p).length > 0;
-            });
-            if (bad.length) { console.error("Unprotected or invalid HTML:", bad); process.exit(1); }
-          '
+          node ./tools/veil.js verify ./_encrypted \
+            --input ./site \
+            --id ${{ github.event.repository.name }} \
+            --passphrase-env VEIL_PASSPHRASE
+        env:
+          VEIL_PASSPHRASE: ${{ secrets.VEIL_PASSPHRASE }}
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
@@ -178,13 +175,9 @@ line — that line means HTML fell outside the encrypted roots. Then assert it
 rather than trusting the count:
 
 ```bash
-# must print nothing for a full-site build
-grep -rL --include='*.[Hh][Tt][Mm][Ll]' --include='*.[Hh][Tt][Mm]' 'id="veil-payload"' ./_encrypted
-
-# and check a few strings from different source pages
-for s in "Acme Q3 Proposal" "internal-only" "Day 3 — Kyoto"; do
-  grep -rq "$s" ./_encrypted && echo "LEAK: $s" || echo "ok: $s"
-done
+# fail-closed audit: any unencrypted, orphaned, or altered page exits non-zero
+VEIL_PASSPHRASE=... node ./tools/veil.js verify ./_encrypted \
+  --input ./site --id my-project --passphrase-env VEIL_PASSPHRASE
 ```
 
 Then serve it:
