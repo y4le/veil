@@ -1,316 +1,75 @@
 # Veil
 
-Encrypt static HTML sites at build time. Veil wraps each HTML file in a self-contained shell that prompts for a passphrase and decrypts client-side using Web Crypto. No server, no dependencies, one file.
+Encrypt static HTML sites at build time. Veil wraps each HTML file in a
+self-contained shell that prompts for a passphrase and decrypts client-side
+using Web Crypto. No server, no dependencies, one file.
 
-**Good for:** client previews, trip plans, proposal decks, private-ish docs, prototypes on static hosting.
+**Good for:** client previews, trip plans, proposal decks, private-ish docs,
+prototypes on static hosting.
 
-**Not for:** regulated data, identity-based access control, or protecting against a compromised host.
+**Not for:** regulated data, identity-based access control, or protecting
+against a compromised host.
 
 > [!WARNING]
 > **Veil is deterrence, not absolute security.** It protects against casual
 > browsing and search indexing. It does **not** protect against a compromised
-> host, weak passphrases, or any JavaScript running on the same origin — a
-> script there can read the cached key out of browser storage and decrypt the
-> site. **Only HTML files are encrypted.** Images, fonts, and data files are
-> copied through and stay public; a CSS or JS file that was inlined into
-> encrypted pages is dropped from the output only when nothing public can still
-> reach it, and everything else is copied. Public wrappers carry a constant
-> "Protected page" title, so titles do not leak, but page count, file sizes,
-> and directory structure do.
+> host, weak passphrases, or any JavaScript running on the same origin; a script
+> there can read the cached key out of browser storage and decrypt the site.
+> **Only HTML is encrypted**; images, fonts, and data files stay public, and so
+> do page count, file sizes, and directory structure. Read the
+> [threat model](docs/threat-model.md) before publishing anything you care about.
 
-## Quick Start
+## Quick start
 
 ```bash
-# Encrypt a site (omit --passphrase to be prompted, with confirmation)
-node veil.js ./my-site ./encrypted --passphrase "secret" --id my-project
+read -rs VEIL_PASSPHRASE && export VEIL_PASSPHRASE   # typed, not in shell history
+
+# Encrypt a site into a fresh output directory
+node veil.js ./my-site ./encrypted --passphrase-env VEIL_PASSPHRASE --id my-project
 
 # Audit what you are about to publish
-node veil.js verify ./encrypted --input ./my-site --id my-project
+node veil.js verify ./encrypted --input ./my-site --id my-project \
+  --passphrase-env VEIL_PASSPHRASE
 
 # Serve and test
 python3 -m http.server 8765 --directory ./encrypted
 ```
 
-Open `http://127.0.0.1:8765` — every page prompts for the passphrase, then decrypts in the browser.
+Open `http://127.0.0.1:8765`; every page prompts for the passphrase, then
+decrypts in the browser. Omitting both passphrase options prompts interactively
+instead.
 
-`--passphrase` warns that it is visible in process listings and shell history;
-use `--passphrase-env` or the interactive prompt for anything real. `./encrypted`
-must be absent or empty — Veil builds a fresh artifact and will not write over
-an existing one without `--force`.
+## Documentation
 
-## How It Works
+| Guide | What it covers |
+|---|---|
+| [Getting started](docs/getting-started.md) | First encrypt, audit, unlock, and troubleshooting |
+| [How it works](docs/how-it-works.md) | Inlining, envelope encryption, the wrapper, unlock state |
+| [CLI reference](docs/cli.md) | Every option for both commands, and build behavior |
+| [Verifying a build](docs/verify.md) | What the audit proves, finding codes, chained zones |
+| [Threat model](docs/threat-model.md) | The security boundary, in full |
+| [Integration](docs/integration.md) | Vendoring, pinning, CI, deploying |
 
-1. Veil reads a directory of HTML files (pages being encrypted and assets
-   being inlined must be UTF-8; passthrough files are copied byte-for-byte)
-   and inlines local
-   CSS/JS into each page — relative or root-relative, quoted or unquoted
-   references. Relative `url()`/`@import` paths inside inlined CSS are
-   rewritten so they still resolve from the page. Scripts and stylesheets it
-   must leave in the page (external URLs, module scripts, missing files) are
-   reported with a build warning; cross-origin images and fonts referenced
-   from CSS are blocked by the page CSP too, but are not warned about
-   individually.
-2. It generates a random site master key, wraps it with a key derived from your passphrase (PBKDF2 + AES-256-GCM), and encrypts each HTML file with the master key.
-3. Each encrypted file is replaced with a self-contained wrapper that carries the ciphertext and a minimal unlock UI.
-4. In the browser, the wrapper derives the same key from the passphrase, unwraps the master key, decrypts the page, and caches the key for the session so other pages unlock automatically.
+Host walkthroughs: [GitHub Pages](.agents/skills/veil-integration/references/github-pages.md)
+for a full site, [protected zones](.agents/skills/veil-integration/references/protected-zones.md)
+for a public site with individually locked sections. Coding agents should start
+from [`.agents/AGENT.md`](.agents/AGENT.md).
 
-Non-HTML files (images, fonts, data) are copied as-is and remain public —
-with one exception: a CSS/JS file that was inlined into encrypted pages and
-is referenced by nothing else is omitted from the output, so inlining
-actually shrinks the public surface. Inlined JS is only omitted when the
-whole site is encrypted (no public HTML) and no other JS survives publicly,
-since public pages and scripts can reach it in ways no scanner sees.
+## Alternatives
 
-Runtime behavior worth knowing:
-
-- **HTTPS required.** Web Crypto only exists in secure contexts (HTTPS,
-  localhost, or `file:`). On plain HTTP the wrapper shows a clear error.
-- **The wrapper CSP governs decrypted pages too.** It allows same-origin
-  images, fonts, media, stylesheets, and fetches, plus inline scripts and
-  styles. It blocks every `<script src>` — same-origin or external. Inlining
-  (the default) converts local scripts to inline ones; external/third-party
-  scripts never run on protected pages, which also protects the cached key
-  in browser storage. With `--no-inline`, local JS will not execute.
-- **Titles are not leaked.** The public wrapper always says "Protected page"
-  (with a `noindex` robots meta); the real title appears after decryption.
-- **Lock/logout.** The 🔒 button or `?veil=logout` clears cached keys.
-
-## CLI
-
-```
-Usage: veil <input-dir> <output-dir> [options]
-       veil verify <output-dir> [options]
-
-Options:
-  --passphrase <pass>   Set passphrase (omit to prompt interactively)
-  --passphrase-env <n>  Read passphrase from environment variable <n>
-  --id <site-id>        Storage key scope (default: output dir basename)
-  --iterations <N>      PBKDF2 iteration count (default: 600000)
-  --remember            Check "Remember this device" by default
-  --html-root <dir>     Encrypt only HTML under this input-relative dir (repeatable)
-  --no-inline           Skip local CSS/JS inlining
-  --force               Replace a non-empty output directory
-  --version             Print the veil version
-  --help                Show this help
-```
-
-The output directory is a fresh artifact on every run: Veil builds into a
-temporary sibling directory and moves it into place on success, so stale files
-from earlier builds can never linger in (and be deployed from) the output. A
-non-empty output directory is only replaced when you pass `--force`. Symlinks
-inside the input tree are rejected rather than silently skipped or followed
-(the input path itself may be a symlink).
-
-### CI Usage
-
-In CI, always use `--passphrase-env` to read from a secret — never pass the
-passphrase as a CLI argument, where process listings and shell history can see
-it. Veil warns on stderr whenever `--passphrase` is used:
-
-```bash
-node veil.js ./site ./_encrypted \
-  --passphrase-env VEIL_PASSPHRASE \
-  --id my-project
-```
-
-### Selective Encryption
-
-Use `--html-root` to encrypt only part of a site while leaving other pages public:
-
-```bash
-node veil.js ./site ./_encrypted \
-  --passphrase-env VEIL_PASSPHRASE \
-  --id client-portal \
-  --html-root clients/
-```
-
-Veil reports what it left public on stderr — `veil: leaving N HTML file(s)
-public outside the encrypted roots` — so a mistake in `--html-root` is visible
-in the build log. Because the output directory is a fresh artifact, several
-zones with different passphrases are chained through **successive** output
-directories, not repeated runs into one directory; see
-[`protected-zones.md`](.agents/skills/veil-integration/references/protected-zones.md).
-Note that any script on a public page can read the cached key for the protected
-zones — see the threat model below.
-
-### Verifying a Build
-
-`veil verify` audits an output directory before you publish it. It is the
-answer to the question a build log cannot settle: *is every page that should be
-protected actually protected?*
-
-```
-Usage: veil verify <output-dir> [options]
-
-Options:
-  --html-root <dir>     Audit only this output-relative dir (repeatable)
-  --input <dir>         Compare against the input directory this build was made from
-  --id <site-id>        Require this exact site id
-  --passphrase <pass>   Verify decryption with this passphrase
-  --passphrase-env <n>  Verify decryption with the passphrase in env variable <n>
-  --prompt-passphrase   Verify decryption with a passphrase typed at the terminal
-  --json                Emit the report as JSON
-  --help                Show this help
-```
-
-It is **fail-closed**. With no `--html-root`, every HTML file in the output must
-be a valid, current-format Veil wrapper — one plaintext page fails the audit.
-With `--html-root`, HTML outside those roots is reported as public instead, and
-the exact list is printed so a wrong root is visible rather than silent.
-
-What each stage checks:
-
-- **Always.** Inside the audited scope, every HTML file must be a canonical
-  wrapper: a valid, current-format payload, sealed for the path it actually
-  sits at, wrapped in bytes identical to what Veil generates for that payload —
-  which catches a page edited, minified, or re-CSP'd after the build. The scope
-  must also agree on its shared site metadata, and every page IV must be
-  unique. Outside the scope, only a byte-exact wrapper is certain to be one;
-  see the chained-zones note below. Note what this
-  does *not* prove: a canonical wrapper regenerated around rewritten payload
-  data still matches, and generated pages are exempt from the `--input` byte
-  comparison, so the decryption stage below is the only one that authenticates
-  the ciphertext and key metadata themselves.
-- **`--input`.** Stale files left in the output, input files that never made it
-  there, and passthrough files that no longer match their source. A *non-HTML*
-  file missing from the output is only a warning: an inlined asset that nothing
-  public can reach is deliberately omitted.
-- **A passphrase.** The master key is unwrapped once and every page in scope is
-  decrypted, so a wrong passphrase is reported once rather than as N page
-  failures. Supply it with `--passphrase-env` in CI or `--prompt-passphrase`
-  locally; without any of them the decryption stage is skipped and says so.
-
-Exit codes are `0` clean, `1` errors found, `2` the audit could not be performed
-(bad arguments, a missing directory, an unusable passphrase source) — so `set -e`
-is enough in CI. Warnings alone exit 0. `--json` emits a report with stable
-finding codes:
-
-```bash
-node veil.js verify ./_encrypted --json | jq '.findings[] | {code, path}'
-```
-
-For chained zones, run verify once per zone with that zone's root, id, and
-passphrase — and run *every* zone, because that is where the guarantee lives.
-Outside the audited roots Veil deliberately does not guess. Only a page whose
-bytes exactly equal a generated wrapper is certainly a wrapper; any other
-payload-looking page — an edited or minified wrapper from another zone, but
-equally a public page quoting a payload in a `<textarea>` or code sample — is
-the same bytes to anything short of a real HTML parser. Veil warns about those
-and lists them as public rather than failing them, so an out-of-scope wrapper
-that was tampered with is caught by *its own* zone's run. Skipping a zone
-skips its enforcement.
-
-## Integrate Into Your Project
-
-### Option A: Let an agent do it
-
-There are two clean ways to make Veil agent-friendly:
-
-- **Portable bootstrap doc**: point the agent at `.agents/AGENT.md`.
-- **Repo-local skill discovery**: copy `.agents/` into the target repo so agents that load project skills can discover it automatically.
-
-A one-shot prompt for an agent is:
-
-```
-Read https://raw.githubusercontent.com/y4le/veil/main/.agents/AGENT.md
-and use it to integrate Veil into this project end to end.
-Inspect the repo first, vendor Veil, wire the build and deploy flow,
-and only ask me questions if what stays public, the passphrase layout,
-or secret handling is ambiguous.
-```
-
-If the agent can read the Veil repo, that bootstrap doc is the primary entry point. It tells the agent how to vendor a pinned `veil.js`, detect full-site versus protected-zone setups, wire CI, and verify the result.
-
-That `main` URL is for the human-readable bootstrap doc only. The **executable**
-— `veil.js` — should always be vendored from a specific commit and checked
-against a recorded digest, because it later runs in CI beside the passphrase
-secret. See the pinning recipe in Option B; it applies to agents too.
-
-If the Veil repo is private or the agent does not have GitHub access, a raw GitHub URL will not work. In that case:
-
-- give the agent local access to this repo checkout
-- paste the contents of [`.agents/AGENT.md`](.agents/AGENT.md)
-- or copy `.agents/` into the target repo so the skill is local
-
-For the cleanest “give the agent one URL and let it handle the rest” workflow, Veil itself needs to be publicly readable or mirrored somewhere the agent can fetch without extra auth.
-
-The repo-local skill lives at [`.agents/skills/veil-integration/SKILL.md`](.agents/skills/veil-integration/SKILL.md). That is the right path when you want future agents working inside the target repo to discover the integration guidance automatically.
-
-### Option B: Manual setup
-
-1. **Vendor a pinned `veil.js`** into your project (e.g., `./tools/veil.js`).
-   Pin a specific commit, never `main`: the vendored file runs in CI with the
-   passphrase secret in its environment, so an unreviewed upstream change is a
-   change to code that can read that secret. There are no release tags yet, so
-   a commit SHA is the immutable handle — get one with `git rev-parse HEAD` in
-   a Veil checkout, or copy the full SHA from the commit page on GitHub.
-
-   ```bash
-   # run from the repo root
-   COMMIT=<COMMIT-SHA>
-   mkdir -p ./tools
-   curl -fsSL "https://raw.githubusercontent.com/y4le/veil/$COMMIT/veil.js" -o ./tools/veil.js
-   shasum -a 256 ./tools/veil.js | tee ./tools/veil.js.sha256
-   ```
-
-   Commit `./tools/veil.js`, its digest file, and the commit SHA (a comment in
-   the workflow or a line in the README is enough). Verify the digest after any
-   re-download, and in CI if you fetch rather than vendor:
-
-   ```bash
-   shasum -a 256 -c ./tools/veil.js.sha256
-   ```
-
-   Upgrading Veil means bumping the SHA, re-recording the digest, and reviewing
-   the diff — the same bar as any other dependency bump.
-2. **Add a build step** that runs Veil on your site output.
-3. **Store the passphrase** as a CI secret (e.g., `VEIL_PASSPHRASE` in GitHub Actions).
-4. **Deploy** the Veil output directory. Serve it over HTTPS — Web Crypto only
-   exists in secure contexts, so pages served over plain HTTP cannot decrypt.
-
-For a complete GitHub Pages walkthrough, see [`.agents/skills/veil-integration/references/github-pages.md`](.agents/skills/veil-integration/references/github-pages.md). For public-plus-protected subtree deployments, also see [`.agents/skills/veil-integration/references/protected-zones.md`](.agents/skills/veil-integration/references/protected-zones.md).
-
-## Threat Model
-
-Veil is deterrence on public static hosting, not strong access control. It protects against casual browsing, search indexing, and someone stumbling on the URL. It does **not** protect against:
-
-- Weak passphrases and offline brute-force (the ciphertext is public)
-- Host compromise (the host serves the wrapper JS)
-- **Any JavaScript running on the origin.** This does not require an injection
-  bug. Any script on the origin can read the cached master key from
-  `sessionStorage`/`localStorage`, fetch the public wrappers, and decrypt them
-  — including a third-party analytics tag or chat widget on a *public* page of
-  a selective (`--html-root`) deployment, which never sees a passphrase prompt
-  and may not feel like part of the protected site at all. A stored master key
-  is password-equivalent access to that site. `sessionStorage` limits how long
-  the key survives, not which scripts may read it. Give protected content its
-  own origin — which means its own *hostname* (a dedicated custom domain or
-  subdomain, which GitHub Pages supports per repository). A project site at
-  the default `username.github.io/repo` location is not one: all of an
-  owner's default-location project sites share the `username.github.io`
-  origin and its storage. Run no third-party JS anywhere on the protected
-  origin. Veil's CSP blocks `<script src>` on protected pages, but the
-  public pages sharing the origin are yours to police.
-- Metadata leakage: page count, file sizes, directory structure, public asset
-  paths, and the payload's `path` field, which is the page's public URL path
-
-The right mental model: the alternative was leaving it fully public.
-
-## See Also
-
-[StatiCrypt](https://github.com/robinmoisson/staticrypt) is a more established tool in this space with custom templates, share links, and a decrypt mode. Veil differs in a few ways:
-
-- **Authenticated encryption** — Veil uses AES-256-GCM (detects tampered ciphertext); StatiCrypt uses AES-256-CBC (confidentiality only).
-- **Envelope encryption** — Veil caches a site-specific master key in the browser, never the raw passphrase. StatiCrypt stores a salted password hash.
-- **Auto-inlining** — Veil inlines local CSS/JS into each encrypted page automatically.
-- **Selective encryption** — `--html-root` encrypts subtrees while leaving other pages public.
-- **Zero dependencies** — Veil is a single file with no npm install.
-
-If you need custom prompt templates, share links, or configurable remember-me expiry, StatiCrypt is the more mature choice. If you want authenticated encryption, auto-inlining, subtree control, or a single vendorable file, Veil is a better fit.
+[StatiCrypt](https://github.com/robinmoisson/staticrypt) is the more established
+tool in this space, with custom templates, share links, and configurable
+remember-me expiry. Veil differs in being a single vendorable file with
+authenticated encryption, a cached site key rather than a stored password hash,
+automatic CSS/JS inlining, and subtree control.
 
 ## Requirements
 
-- Node.js 18+ (running `veil.js` itself)
-- No runtime npm dependencies
-- Development only: Node.js 20+ and Playwright (`npm install` +
-  `npx playwright install chromium`) for the browser test suite
+Node.js 18+, and a host that serves over HTTPS. No runtime dependencies.
+
+## Development
+
+`npm test` runs the zero-dependency Node suite. The browser suite needs Node 20+
+and Playwright (`npm install && npx playwright install chromium`), then
+`npm run test:browser`; Playwright is a dev dependency only, and the shipped file
+stays dependency-free. [`PLAN.md`](PLAN.md) is the product and engineering plan.

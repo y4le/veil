@@ -1,29 +1,26 @@
-# GitHub Pages — Full-Site Encryption
+# GitHub Pages: Full-Site Encryption
 
-Encrypt every HTML file in a GitHub Pages site behind a single passphrase. This is the most common Veil setup.
+Encrypt every HTML file in a GitHub Pages site behind a single passphrase. This
+is the most common Veil setup.
 
 ## Prerequisites
 
-- A GitHub repo with static HTML content (source files or build output). The
-  tree Veil reads must contain no symlinks, and every HTML file plus any CSS/JS
-  it inlines must be valid UTF-8 — both are fatal errors, not warnings
-- Node.js 18+ available in CI
-- `veil.js` vendored into the repo (e.g., at `./tools/veil.js`) from a **pinned
-  commit**, with its SHA and digest recorded — see
-  [AGENT.md](../../../AGENT.md#acquiring-veil). Never fetch it from `main` at
-  build time: it runs in the same job as the passphrase secret.
+- A GitHub repo with static HTML (source or build output). The tree Veil reads
+  must contain no symlinks, and every HTML file plus any CSS/JS it inlines must
+  be valid UTF-8; both are fatal errors, not warnings.
+- Node.js 18+ in CI.
+- `veil.js` vendored at e.g. `./tools/veil.js` from a **pinned commit**, with its
+  SHA and digest recorded. See [AGENT.md](../../../AGENT.md#vendor-a-pinned-veiljs).
+  Never fetch it from `main` at build time; it runs in the same job as the
+  passphrase secret.
 
-GitHub Pages serves over HTTPS, which Veil requires — Web Crypto only exists in
-secure contexts. If you front the site with a custom domain, keep "Enforce
-HTTPS" on; on plain HTTP the wrapper refuses to decrypt and says so.
+GitHub Pages serves over HTTPS, which Veil requires. With a custom domain, keep
+"Enforce HTTPS" on; on plain HTTP the wrapper refuses to decrypt and says so.
 
-### Setting Up GitHub Pages (if not already enabled)
+If Pages is not enabled yet: **Settings > Pages**, set **Source** to **GitHub
+Actions**. No branch selection needed; the workflow uploads the artifact.
 
-1. Go to **Settings > Pages** in the repo
-2. Set **Source** to **GitHub Actions**
-3. No need to select a branch — the workflow handles artifact upload directly
-
-## Repository Layout
+## Repository layout
 
 ```
 my-repo/
@@ -34,20 +31,19 @@ my-repo/
 ├── tools/
 │   ├── veil.js          # Vendored Veil CLI, pinned to a commit
 │   └── veil.js.sha256   # Recorded digest, checked in CI
-└── .github/
-    └── workflows/
-        └── deploy.yml
+└── .github/workflows/deploy.yml
 ```
 
-## Set the Passphrase Secret
+## Set the passphrase secret
 
 ```bash
 gh secret set VEIL_PASSPHRASE --repo owner/repo
 ```
 
-Enter the passphrase when prompted. This value never appears in logs or workflow files. Pass it to Veil with `--passphrase-env`, never `--passphrase` — Veil warns on stderr that a CLI-supplied passphrase is visible in process listings and shell history.
+Pass it with `--passphrase-env`, never `--passphrase`; Veil warns on stderr that
+a CLI-supplied passphrase is visible in process listings and shell history.
 
-## GitHub Actions Workflow
+## Workflow
 
 ```yaml
 name: Deploy encrypted site
@@ -77,14 +73,6 @@ jobs:
         with:
           node-version: '20'
 
-      # If the site has a build step, run it here and point Veil
-      # at the build output directory instead of ./site:
-      #
-      # - name: Build site
-      #   run: npm run build
-      #
-      # Then change ./site below to your build output dir.
-
       # Vendored from raw.githubusercontent.com/y4le/veil/<COMMIT-SHA>/veil.js
       - name: Verify vendored Veil
         run: shasum -a 256 -c ./tools/veil.js.sha256
@@ -99,9 +87,9 @@ jobs:
 
       - name: Verify the encrypted output
         # Fail-closed audit: every HTML file must be a valid, current-format
-        # wrapper sealed for its own path, no unexpected or modified files,
-        # and the ciphertext must actually decrypt. Exit 1 on findings, 2 if
-        # the audit itself cannot run.
+        # wrapper sealed for its own path, no unexpected or modified files, and
+        # the ciphertext must actually decrypt. Exit 1 on findings, 2 if the
+        # audit itself cannot run.
         run: |
           node ./tools/veil.js verify ./_encrypted \
             --input ./site \
@@ -118,9 +106,12 @@ jobs:
         uses: actions/deploy-pages@v4
 ```
 
-## With a Build Step
+## With a build step
 
-If the site uses Jekyll, Hugo, Vite, or another generator, add the build before encryption:
+If the site uses Jekyll, Hugo, Vite, or another generator, build first and point
+Veil at the output; its input must always be the publishable site. A repo whose
+checked-in HTML *is* the deploy artifact needs no build step, and the workflow
+above applies as written.
 
 ```yaml
 - name: Build site
@@ -135,35 +126,28 @@ If the site uses Jekyll, Hugo, Vite, or another generator, add the build before 
     VEIL_PASSPHRASE: ${{ secrets.VEIL_PASSPHRASE }}
 ```
 
-The key rule: Veil runs on **build output**, not on source files.
+Pass the same directory to `verify --input`.
 
-## Local Verification
-
-Test locally before pushing to CI. Build into a fresh output directory — Veil
-stages each build in a temporary sibling directory and moves it into place, and
-it refuses a non-empty destination so a stale file from an earlier build can
-never be deployed:
+## Local verification
 
 ```bash
 rm -rf ./_encrypted
-VEIL_PASSPHRASE="testpass" node ./tools/veil.js ./site ./_encrypted \
-  --passphrase-env VEIL_PASSPHRASE \
-  --id my-project
+export VEIL_PASSPHRASE=testpass   # throwaway; type a real one with: read -rs VEIL_PASSPHRASE
+
+node ./tools/veil.js ./site ./_encrypted \
+  --passphrase-env VEIL_PASSPHRASE --id my-project
+
+node ./tools/veil.js verify ./_encrypted \
+  --input ./site --id my-project --passphrase-env VEIL_PASSPHRASE
+
+python3 -m http.server 8765 --directory ./_encrypted
 ```
 
-Re-running without clearing the directory first gives:
+Veil refuses a non-empty output directory, so clear it or pass `--force`; a
+fresh CI runner needs neither.
 
-```text
-veil: output directory is not empty: /abs/path/_encrypted
-Veil replaces the whole output directory so stale files from earlier
-builds can never be deployed. Re-run with --force to replace it.
-```
-
-`rm -rf` or `--force` both fix it. Use `--force` in pipelines that reuse a build
-directory between runs; there is no reason to add it to a fresh CI runner.
-
-Read the build's combined output before opening a browser (warnings are on
-stderr; the `encrypted N` / `omitting N` counts are on stdout):
+Read the build's output before opening a browser (warnings on stderr, counts on
+stdout):
 
 ```text
 veil: copying 4 non-HTML file(s) unencrypted — these remain public
@@ -171,83 +155,26 @@ veil: encrypted 12 HTML file(s) → /abs/path/_encrypted
 ```
 
 For a full-site build there must be **no** `veil: leaving N HTML file(s) public`
-line — that line means HTML fell outside the encrypted roots. Then assert it
-rather than trusting the count:
+line; that line means HTML fell outside the encrypted roots. The counts are not
+verification, though: `veil verify` is, and it exits non-zero on any
+unencrypted, orphaned, or altered page. See
+[docs/verify.md](https://github.com/y4le/veil/blob/main/docs/verify.md).
 
-```bash
-# fail-closed audit: any unencrypted, orphaned, or altered page exits non-zero
-VEIL_PASSPHRASE=... node ./tools/veil.js verify ./_encrypted \
-  --input ./site --id my-project --passphrase-env VEIL_PASSPHRASE
-```
+Then at `http://127.0.0.1:8765`, a secure context so Web Crypto works:
 
-Then serve it:
+- every page shows the prompt, titled "Protected page"
+- the correct passphrase unlocks and the real title returns
+- a wrong passphrase shows an error and stays locked
+- other pages auto-unlock within the session
+- reopening the tab returns to the locked state, unless `--remember` was used
+- images and styles render after unlock
 
-```bash
-python3 -m http.server 8765 --directory ./_encrypted
-```
+If something is missing after unlock, check the console for CSP violations: the
+wrapper's CSP survives into the decrypted document and blocks every
+`<script src>`, same-origin or external. Inlining turns local scripts into inline
+ones so they still run; `--no-inline` leaves local JavaScript unable to execute.
 
-Open `http://127.0.0.1:8765` — a secure context, so Web Crypto works — and verify:
+## Next steps
 
-- Every page shows the Veil passphrase prompt
-- Correct passphrase unlocks content, and the page's real title returns (the
-  locked page is always titled "Protected page", with a `noindex` robots meta)
-- Wrong passphrase shows an error and stays locked
-- After unlocking one page, other pages auto-unlock within the same session
-- Closing and reopening the tab returns to the locked state (unless `--remember` was used)
-- Images, fonts, and styles render after unlock. If something is missing, check
-  the console for CSP violations: the wrapper's CSP survives into the decrypted
-  document and blocks every `<script src>`, same-origin or external. Inlining
-  turns local scripts into inline ones so they still run; third-party scripts
-  never will.
-
-## Common Options
-
-### Remember device by default
-
-```bash
-node ./tools/veil.js ./site ./_encrypted \
-  --passphrase-env VEIL_PASSPHRASE \
-  --id my-project \
-  --remember
-```
-
-### Skip CSS/JS inlining
-
-If auto-inlining causes issues with large bundles or complex asset paths:
-
-```bash
-node ./tools/veil.js ./site ./_encrypted \
-  --passphrase-env VEIL_PASSPHRASE \
-  --id my-project \
-  --no-inline
-```
-
-Understand the cost first. The wrapper CSP blocks every `<script src>`, so with
-`--no-inline` local JS **will not execute** on decrypted pages — same-origin
-stylesheets and images still load. Inlining is also what shrinks the public
-surface: an inlined CSS file that nothing public references is dropped from the
-output, and inlined JS is dropped when the whole site is encrypted and no JS
-survives publicly. With `--no-inline`, every asset stays in the public output.
-
-### Reusing a build directory
-
-```bash
-node ./tools/veil.js ./site ./_encrypted \
-  --passphrase-env VEIL_PASSPHRASE \
-  --id my-project \
-  --force
-```
-
-### Checking vendored provenance
-
-```bash
-shasum -a 256 -c ./tools/veil.js.sha256
-```
-
-The recorded commit SHA plus this digest are the provenance check. Note
-that `--version` reads a `package.json` next to `veil.js`, so a vendored
-single file prints `veil unknown` — it verifies nothing about provenance.
-
-## Next Steps
-
-If parts of the site should stay public while other sections are individually protected, see [Protected Zones](protected-zones.md).
+If parts of the site should stay public while other sections are individually
+protected, see [Protected Zones](protected-zones.md).
