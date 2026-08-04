@@ -254,9 +254,11 @@ The HTML wrappers are self-contained, but the output directory is not necessaril
 
 Policy:
 
-- inline local CSS and JS by default
-- leave external URLs untouched
-- copy non-HTML assets as-is
+- inline local CSS and JS by default (relative and root-relative, quoted and unquoted)
+- rewrite relative `url()`/`@import` inside inlined CSS to stay page-resolvable
+- leave external URLs untouched, with a build warning for the scripts and stylesheets the page CSP will block (cross-origin images and fonts referenced from CSS are blocked too, but are not individually reported)
+- require UTF-8 for HTML and inlined assets; fail the build otherwise
+- copy non-HTML assets as-is, except assets inlined everywhere and referenced by nothing public — those are omitted (inlined JS is omitted only when the whole site is encrypted (no public HTML) and no other JS survives publicly, since module graphs and inline event handlers are not scanned)
 - warn clearly that copied assets remain public
 
 This is the main place where the docs must stay precise. “Self-contained output” is true for encrypted HTML wrappers, but not for every file in the output directory unless image and data inlining are added later.

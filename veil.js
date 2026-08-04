@@ -183,18 +183,187 @@ function shouldEncryptHtml(relPath, htmlRoots) {
 // Asset inlining
 // ---------------------------------------------------------------------------
 
-/** Check if a URL should not be inlined (external, absolute, or non-http scheme). */
-function isExternalUrl(url) {
-  // Protocol-relative, http(s), or any explicit scheme (data:, file:, blob:, javascript:)
-  if (/^\/\/|^[a-z][a-z0-9+.-]*:/i.test(url)) return true;
-  // Absolute path (site-root reference) — can't resolve locally
-  if (url.startsWith('/')) return true;
-  return false;
+/**
+ * Find the true end of the opening tag that starts at `start` (the '<'),
+ * returning the index just past its '>'. Quoted attribute values are skipped
+ * whole, so a '>' inside one cannot truncate the tag. A quote only opens a
+ * value right after '=', matching how browsers tokenize `href=x'y`.
+ */
+function findTagEnd(html, start) {
+  let i = start + 1;
+  let afterEquals = false;
+  while (i < html.length) {
+    const ch = html[i];
+    if (ch === '=') {
+      afterEquals = true;
+    } else if (/\s/.test(ch)) {
+      // separator: whatever came before still applies
+    } else if (afterEquals && (ch === '"' || ch === "'")) {
+      const close = html.indexOf(ch, i + 1);
+      i = close === -1 ? html.length : close + 1;
+      afterEquals = false;
+      continue;
+    } else if (ch === '>') {
+      return i + 1;
+    } else {
+      afterEquals = false;
+    }
+    i++;
+  }
+  return html.length;
 }
 
-/** Resolve a local asset path, confined within the allowed root directory. */
-function resolveAssetPath(htmlDir, href, inputRoot) {
-  const resolved = path.resolve(htmlDir, href);
+/**
+ * Elements whose content a browser tokenizes as text rather than markup:
+ * raw text (script, style, xmp, iframe, noembed, noframes) and RCDATA
+ * (textarea, title). Both end at the first matching close sequence.
+ *
+ * <noscript> is included because decrypted Veil pages always run with
+ * scripting enabled, where its content is raw text ending at the first
+ * </noscript> — rewriting inside it could push author bytes (e.g. a CSS
+ * string containing "</noscript>") out into active markup. Public-side
+ * reference collection separately scans noscript bodies as markup so
+ * scripting-disabled fallback assets are still retained.
+ */
+const RAW_TEXT_ELEMENTS = new Set([
+  'script', 'style', 'noscript', 'textarea', 'title', 'xmp', 'iframe', 'noembed', 'noframes',
+]);
+
+/**
+ * Walk a document once and yield its opening tags, skipping everything a
+ * browser would not read as markup: comments, doctypes, closing tags, and the
+ * text inside raw-text and RCDATA elements. Tag-shaped text in an attribute
+ * value, a comment, or a script body therefore never reaches the passes below.
+ *
+ * Each token is { name (lowercased), tag, start, end }, where start..end spans
+ * the opening tag. A raw-text element also carries rawEnd (where its body
+ * stops) and closeEnd (just past its closing tag, or null when the document
+ * ends first), so a pass can replace the whole element as one span.
+ */
+function* scanTags(html) {
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf('<', i);
+    if (lt === -1) return;
+    const next = html[lt + 1];
+    if (html.startsWith('<!--', lt)) {
+      const close = html.indexOf('-->', lt + 4);
+      i = close === -1 ? html.length : close + 3;
+      continue;
+    }
+    if (next === '!' || next === '?' || next === '/') {
+      const close = html.indexOf('>', lt);
+      i = close === -1 ? html.length : close + 1;
+      continue;
+    }
+    if (next === undefined || !/[a-zA-Z]/.test(next)) {
+      i = lt + 1; // stray '<': data, not a tag
+      continue;
+    }
+    const end = findTagEnd(html, lt);
+    let j = lt + 1;
+    while (j < html.length && !/[\s/>]/.test(html[j])) j++;
+    const token = { name: html.slice(lt + 1, j).toLowerCase(), tag: html.slice(lt, end), start: lt, end };
+    i = end;
+    if (RAW_TEXT_ELEMENTS.has(token.name)) {
+      // Text, not markup: it ends at the first matching close sequence
+      // whatever the quoting, so nothing inside can be a tag.
+      const closer = new RegExp(`</${token.name}`, 'gi');
+      closer.lastIndex = end;
+      const m = closer.exec(html);
+      token.rawEnd = m ? m.index : html.length;
+      const gt = m ? html.indexOf('>', closer.lastIndex) : -1;
+      token.closeEnd = gt === -1 ? null : gt + 1;
+      i = token.closeEnd === null ? html.length : token.closeEnd;
+    }
+    yield token;
+    // Everything after <plaintext> is text: no tag can follow it.
+    if (token.name === 'plaintext') return;
+  }
+}
+
+/**
+ * Find an attribute in a tag string, tokenizing the tag rather than pattern
+ * matching it: text that looks like an attribute inside another attribute's
+ * quoted value can never match, and `data-src` can never match `src`.
+ *
+ * Returns { value, start, end } for the first attribute whose name matches
+ * (case-insensitively), where start..end is the exact span the attribute
+ * occupies in `tag` and value is null for a valueless attribute.
+ */
+function findAttr(tag, name) {
+  const target = name.toLowerCase();
+  let i = 1; // skip '<'
+  while (i < tag.length && !/[\s/>]/.test(tag[i])) i++; // skip the tag name
+  while (i < tag.length) {
+    while (i < tag.length && /[\s/]/.test(tag[i])) i++;
+    if (i >= tag.length || tag[i] === '>') break;
+    const start = i;
+    while (i < tag.length && !/[\s=/>]/.test(tag[i])) i++;
+    const attrName = tag.slice(start, i);
+    if (attrName === '') {
+      i++; // stray '=' or similar: step over it so the scan cannot stall
+      continue;
+    }
+    let end = i;
+    let value = null;
+    let j = i;
+    while (j < tag.length && /\s/.test(tag[j])) j++;
+    if (tag[j] === '=') {
+      j++;
+      while (j < tag.length && /\s/.test(tag[j])) j++;
+      const quote = tag[j];
+      if (quote === '"' || quote === "'") {
+        const close = tag.indexOf(quote, j + 1);
+        value = close === -1 ? tag.slice(j + 1) : tag.slice(j + 1, close);
+        end = close === -1 ? tag.length : close + 1;
+      } else {
+        const from = j;
+        while (j < tag.length && !/[\s>]/.test(tag[j])) j++;
+        value = tag.slice(from, j);
+        end = j;
+      }
+      i = end;
+    }
+    if (attrName.toLowerCase() === target) return { value, start, end };
+  }
+  return null;
+}
+
+/** Extract an attribute value from a tag string (quoted or unquoted). */
+function getAttr(tag, name) {
+  const found = findAttr(tag, name);
+  return found ? found.value : null;
+}
+
+/** Split a URL into its path part and any ?query#fragment suffix. */
+function splitUrl(url) {
+  const i = url.search(/[?#]/);
+  return i === -1
+    ? { pathPart: url, suffix: '' }
+    : { pathPart: url.slice(0, i), suffix: url.slice(i) };
+}
+
+/** True for URLs Veil can never resolve locally: schemes and protocol-relative. */
+function isExternalUrl(url) {
+  return /^\/\/|^[a-z][a-z0-9+.-]*:/i.test(url);
+}
+
+/**
+ * Resolve a local asset reference (relative or root-relative) to a real,
+ * input-root-confined filesystem path. Returns null when the file is
+ * missing, escapes the root, or the URL cannot be decoded.
+ */
+function resolveAssetPath(baseDir, urlPath, inputRoot) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(urlPath);
+  } catch {
+    return null;
+  }
+  const resolved = decoded.startsWith('/')
+    ? path.join(inputRoot, decoded.slice(1))
+    : path.resolve(baseDir, decoded);
   try {
     const real = fs.realpathSync(resolved);
     const realRoot = fs.realpathSync(inputRoot);
@@ -206,67 +375,446 @@ function resolveAssetPath(htmlDir, href, inputRoot) {
   }
 }
 
+/**
+ * Read a text file, requiring valid UTF-8. Everything Veil encrypts or
+ * inlines is re-encoded as UTF-8 in the browser, so a page or asset in any
+ * other encoding would be silently corrupted — fail loudly instead.
+ */
+function readUtf8(file, label) {
+  const buf = fs.readFileSync(file);
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    // Throw (not fatal/exit) so staging cleanup in main() still runs.
+    const err = new Error(`not valid UTF-8: ${label}\nVeil requires UTF-8 text inputs (HTML and inlined CSS/JS).`);
+    err.code = 'VEIL_NOT_UTF8';
+    throw err;
+  }
+}
+
 /** Escape </script> sequences in JS to prevent premature tag closure. */
 function escapeScriptClose(js) {
   return js.replace(/<\/(script)/gi, '<\\/$1');
 }
 
+/** Escape </style> sequences in CSS the same way (\/ is a valid CSS escape). */
+function escapeStyleClose(css) {
+  return css.replace(/<\/(style)/gi, '<\\/$1');
+}
+
+/**
+ * Resolve CSS escape sequences to the characters they denote, so a reference
+ * written as `my\ icon.png` or `\69 con.png` names the file it means. CSS
+ * preprocessing folds CRLF into one newline, so the pair terminates a hex
+ * escape as a unit.
+ */
+function cssUnescape(s) {
+  return s.replace(/\\([0-9a-fA-F]{1,6})(?:\r\n|[ \t\n\r\f])?|\\(?:\r\n|[\n\r\f])|\\([\s\S])/g, (m, hex, ch) => {
+    if (ch !== undefined) return ch;
+    // A backslash before a newline is a line continuation: it contributes
+    // nothing, not the newline itself.
+    if (hex === undefined) return '';
+    const cp = parseInt(hex, 16);
+    return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '�';
+  });
+}
+
+/** Characters that must not survive raw inside an emitted url("...") token. */
+const SUFFIX_ESCAPES = { '"': '%22', "'": '%27', '\\': '%5C', '(': '%28', ')': '%29' };
+
+/** Convert a real path under realRoot to a posix input-relative path. */
+function rootRelPosix(realPath, realRoot) {
+  return path.relative(realRoot, realPath).split(path.sep).join('/');
+}
+
+/**
+ * Rewrite relative and root-relative url()/@import references in CSS that
+ * is being moved from its own file into a page, so they still resolve from
+ * the page's location. External, data:, and fragment-only URLs are left
+ * alone; unresolvable local references are left unchanged and reported.
+ *
+ * The scan is lexical, not a set of global regexes: comments and ordinary
+ * string literals are copied through verbatim, so `content:"url(x.png)"` and
+ * commented-out rules survive untouched. It is not a CSS parser — it only
+ * knows comments, strings, and the two tokens it rewrites.
+ */
+function rewriteCssUrls(css, cssDir, pageDirPosix, inputRoot, onWarn, onKeep) {
+  const realRoot = fs.realpathSync(inputRoot);
+  const n = css.length;
+
+  // kind is 'import' for stylesheet loads, 'url' for everything else.
+  const rewriteOne = (rawUrl, kind) => {
+    const { pathPart, suffix } = splitUrl(cssUnescape(rawUrl));
+    if (pathPart === '') return null;
+    if (isExternalUrl(pathPart)) {
+      // Images and fonts have their own CSP directives and commonly live on
+      // a CDN; only cross-origin stylesheet loads are worth reporting.
+      if (kind === 'import') {
+        onWarn(rawUrl, 'external CSS reference left as-is; cross-origin loads are blocked by the page CSP');
+      }
+      return null;
+    }
+    const real = resolveAssetPath(cssDir, pathPart, inputRoot);
+    if (!real) {
+      onWarn(rawUrl, 'CSS reference not found inside the input directory; left unchanged');
+      return null;
+    }
+    onKeep(real);
+    const rel = path.posix.relative(pageDirPosix, rootRelPosix(real, realRoot));
+    // The result is emitted inside url("...")/@import "...". Percent-encode
+    // each path segment so quotes, '#', '?' and backslashes in file names
+    // cannot escape it, and the query/fragment for the same reason — leaving
+    // '?', '#', '&' and '=' intact so the suffix still means what it did.
+    // encodeURIComponent leaves ' ( ) alone, so those are mapped explicitly.
+    const safeSuffix = suffix.replace(/["'\\()\s]/g, (c) => SUFFIX_ESCAPES[c] || encodeURIComponent(c));
+    return rel.split('/').map(encodeURIComponent).join('/') + safeSuffix;
+  };
+
+  /** Read a quoted string starting at its opening quote; escapes stay raw. */
+  const readString = (start) => {
+    const quote = css[start];
+    let j = start + 1;
+    let value = '';
+    while (j < n) {
+      const ch = css[j];
+      if (ch === '\\' && j + 1 < n) {
+        value += ch + css[j + 1];
+        j += 2;
+      } else if (ch === quote) {
+        j++;
+        break;
+      } else {
+        value += ch;
+        j++;
+      }
+    }
+    return { value, end: j };
+  };
+
+  const isUrlToken = (pos) => /^url\(/i.test(css.slice(pos, pos + 4));
+
+  /** Consume a url(...) token at pos; null when it is not well formed. */
+  const readUrlToken = (pos, kind) => {
+    let j = pos + 4;
+    while (j < n && /\s/.test(css[j])) j++;
+    let rawUrl;
+    let argEnd;
+    if (css[j] === '"' || css[j] === "'") {
+      const str = readString(j);
+      rawUrl = str.value;
+      argEnd = str.end;
+    } else {
+      const from = j;
+      // An escape can carry any character into an unquoted url, whitespace
+      // and quotes included, so it is consumed as a unit: a hex escape runs
+      // up to six digits plus one optional whitespace terminator.
+      while (j < n && !/['")\s]/.test(css[j])) {
+        if (css[j] !== '\\' || j + 1 >= n) {
+          j++;
+          continue;
+        }
+        j++;
+        const hex = /^[0-9a-fA-F]{1,6}/.exec(css.slice(j, j + 6));
+        if (!hex) {
+          j++;
+          continue;
+        }
+        j += hex[0].length;
+        // CRLF is one newline after preprocessing, so it terminates the
+        // escape as a pair; any other whitespace character does so alone.
+        if (css[j] === '\r' && css[j + 1] === '\n') j += 2;
+        else if (/[ \t\r\n\f]/.test(css[j] || '')) j++;
+      }
+      rawUrl = css.slice(from, j);
+      argEnd = j;
+    }
+    let k = argEnd;
+    while (k < n && /\s/.test(css[k])) k++;
+    if (css[k] !== ')') return null;
+    const rewritten = rewriteOne(rawUrl, kind);
+    return {
+      text: rewritten === null ? css.slice(pos, k + 1) : `url("${rewritten}")`,
+      end: k + 1,
+    };
+  };
+
+  /** Skip the whitespace and comments that separate tokens, from pos. */
+  const skipSeparators = (pos) => {
+    let j = pos;
+    for (;;) {
+      if (j < n && /\s/.test(css[j])) {
+        j++;
+      } else if (css[j] === '/' && css[j + 1] === '*') {
+        const close = css.indexOf('*/', j + 2);
+        j = close === -1 ? n : close + 2;
+      } else {
+        return j;
+      }
+    }
+  };
+
+  let out = '';
+  let i = 0;
+  let depth = 0; // brace nesting, counted outside strings and comments
+  while (i < n) {
+    const ch = css[i];
+    if (ch === '/' && css[i + 1] === '*') {
+      const close = css.indexOf('*/', i + 2);
+      const end = close === -1 ? n : close + 2;
+      out += css.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const str = readString(i);
+      out += css.slice(i, str.end);
+      i = str.end;
+      continue;
+    }
+    // A url token only counts at an identifier boundary, so `-moz-url(` and
+    // the tail of an identifier are not mistaken for one.
+    if (isUrlToken(i) && !/[A-Za-z0-9_\-\\]/.test(css[i - 1] || '')) {
+      const tok = readUrlToken(i, 'url');
+      out += tok ? tok.text : css.slice(i, i + 4);
+      i = tok ? tok.end : i + 4;
+      continue;
+    }
+    // @import is only valid at the top level of a stylesheet, so it is only
+    // recognized at depth 0: text inside a block — a declaration value such
+    // as `--x: @import "y";` — belongs to something larger and is copied
+    // through. Its argument may follow immediately (`@import"y.css"`).
+    if (ch === '@' && depth === 0 && /^@import/i.test(css.slice(i, i + 7))) {
+      const j = skipSeparators(i + 7);
+      if (css[j] === '"' || css[j] === "'") {
+        const str = readString(j);
+        const rewritten = rewriteOne(str.value, 'import');
+        out += css.slice(i, j) + (rewritten === null ? css.slice(j, str.end) : `"${rewritten}"`);
+        i = str.end;
+        continue;
+      }
+      if (isUrlToken(j)) {
+        const tok = readUrlToken(j, 'import');
+        if (tok) {
+          out += css.slice(i, j) + tok.text;
+          i = tok.end;
+          continue;
+        }
+      }
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}' && depth > 0) depth--;
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Collect the local url()/@import targets of a stylesheet as real paths.
+ * The rewriter doubles as the scanner — its keep callback reports every
+ * reference it resolves — so both share one CSS lexer.
+ */
+function collectCssRefs(cssText, baseDir, inputRoot) {
+  const refs = new Set();
+  rewriteCssUrls(cssText, baseDir, '.', inputRoot, () => {}, (real) => refs.add(real));
+  return refs;
+}
+
 /**
  * Inline local CSS <link> tags and local JS <script src> tags into the HTML.
- * External URLs are left untouched. Paths are confined to inputRoot.
+ *
+ * Returns the transformed HTML plus a report used by the build layer:
+ * - inlined: real paths whose contents were embedded
+ * - inlinedScripts: the subset of those embedded as JavaScript, which the
+ *   build layer must treat as JS whatever the file is named
+ * - kept: real paths that remain referenced at runtime (CSS url()/@import
+ *   targets, module scripts) and must stay in the public output
+ * - warnings: per-resource notes about references that stay in the page,
+ *   including ones the page CSP will block
  *
  * @param {string} html - The HTML content
- * @param {string} htmlDir - The directory containing the HTML file
+ * @param {string} pageRelPath - The page path relative to inputRoot
  * @param {string} inputRoot - The top-level input directory (path confinement boundary)
- * @returns {string} HTML with local assets inlined
  */
-function inlineAssets(html, htmlDir, inputRoot) {
+function inlineAssets(html, pageRelPath, inputRoot) {
+  const htmlDir = path.dirname(path.join(inputRoot, pageRelPath));
+  const pageDirPosix = path.posix.dirname(pageRelPath.split(path.sep).join('/'));
+  const inlined = new Set();
+  const inlinedScripts = new Set();
+  const kept = new Set();
+  const warnings = [];
+  const warn = (url, reason) => warnings.push({ page: pageRelPath, url, reason });
+
   // Inline local CSS: <link rel="stylesheet" href="local.css"> → <style>contents</style>
-  html = html.replace(
-    /<link\s+[^>]*rel\s*=\s*["']stylesheet["'][^>]*>/gi,
-    (tag) => {
-      const hrefMatch = tag.match(/href\s*=\s*["']([^"']+)["']/i);
-      if (!hrefMatch) return tag;
-      const href = hrefMatch[1].split(/[?#]/)[0]; // strip query/hash
-      if (isExternalUrl(href)) return tag;
-      const cssPath = resolveAssetPath(htmlDir, href, inputRoot);
-      if (!cssPath) return tag;
-      try {
-        const css = fs.readFileSync(cssPath, 'utf8');
-        // Preserve media attribute if present
-        const mediaMatch = tag.match(/media\s*=\s*["']([^"']+)["']/i);
-        const mediaAttr = mediaMatch ? ` media="${mediaMatch[1]}"` : '';
-        return `<style${mediaAttr}>${css}</style>`;
-      } catch {
-        console.warn(`veil: warning: could not inline CSS: ${href}`);
-        return tag;
-      }
+  // Returns the replacement for a stylesheet link, or null to keep it.
+  const inlineLink = (tag) => {
+    const rel = getAttr(tag, 'rel');
+    if (!rel || !rel.trim().toLowerCase().split(/\s+/).includes('stylesheet')) return null;
+    const href = getAttr(tag, 'href');
+    if (!href) return null;
+    const { pathPart } = splitUrl(href);
+    if (pathPart === '') return null;
+    if (isExternalUrl(pathPart)) {
+      warn(href, 'external stylesheet left as-is; cross-origin stylesheets are blocked by the page CSP');
+      return null;
     }
-  );
+    const cssPath = resolveAssetPath(htmlDir, pathPart, inputRoot);
+    if (!cssPath) {
+      warn(href, 'stylesheet not found inside the input directory; left as a reference');
+      return null;
+    }
+    try {
+      let css = readUtf8(cssPath, `${href} (inlined by ${pageRelPath})`);
+      css = rewriteCssUrls(
+        css,
+        path.dirname(cssPath),
+        pageDirPosix,
+        inputRoot,
+        (u, reason) => warn(`${href} → ${u}`, reason),
+        (real) => kept.add(real)
+      );
+      css = escapeStyleClose(css);
+      inlined.add(cssPath);
+      const media = getAttr(tag, 'media');
+      const mediaAttr = media ? ` media="${media}"` : '';
+      return `<style${mediaAttr}>${css}</style>`;
+    } catch (err) {
+      if (err && err.code === 'VEIL_NOT_UTF8') throw err;
+      warn(href, 'could not read stylesheet; left as a reference');
+      return null;
+    }
+  };
 
   // Inline local JS: <script src="local.js"></script> → <script>contents</script>
-  html = html.replace(
-    /<script\s+[^>]*src\s*=\s*["']([^"']+)["'][^>]*>\s*<\/script>/gi,
-    (tag, src) => {
-      src = src.split(/[?#]/)[0]; // strip query/hash
-      if (isExternalUrl(src)) return tag;
-      const jsPath = resolveAssetPath(htmlDir, src, inputRoot);
-      if (!jsPath) return tag;
-      try {
-        const js = escapeScriptClose(fs.readFileSync(jsPath, 'utf8'));
-        // Preserve other attributes (type, etc.) minus src
-        const openTag = tag
-          .match(/<script\s[^>]*>/i)[0]
-          .replace(/\s*src\s*=\s*["'][^"']*["']/i, '');
-        return `${openTag}${js}</script>`;
-      } catch {
-        console.warn(`veil: warning: could not inline JS: ${src}`);
-        return tag;
+  // Returns the replacement for an empty-bodied script tag, or null to keep it.
+  const inlineScript = (tag) => {
+    const src = getAttr(tag, 'src');
+    if (!src) return null;
+    const { pathPart } = splitUrl(src);
+    if (pathPart === '') return null;
+    if (isExternalUrl(pathPart)) {
+      warn(src, 'external script will be blocked by the page CSP (scripts must be inline)');
+      return null;
+    }
+    const type = (getAttr(tag, 'type') || '').trim().toLowerCase();
+    if (type === 'module') {
+      // Inlining a module changes its import base URL; leave it, keep the
+      // file public, and be explicit that the CSP will block it.
+      const real = resolveAssetPath(htmlDir, pathPart, inputRoot);
+      if (real) kept.add(real);
+      warn(src, 'module script cannot be inlined and will be blocked by the page CSP');
+      return null;
+    }
+    const jsPath = resolveAssetPath(htmlDir, pathPart, inputRoot);
+    if (!jsPath) {
+      warn(src, 'script not found inside the input directory; the reference will be blocked by the page CSP');
+      return null;
+    }
+    try {
+      const js = escapeScriptClose(readUtf8(jsPath, `${src} (inlined by ${pageRelPath})`));
+      inlined.add(jsPath);
+      inlinedScripts.add(jsPath);
+      // Preserve other attributes (type, data-*, etc.) minus src, cutting the
+      // exact span the tokenizer found rather than re-matching it.
+      let openTag = tag;
+      const srcAttr = findAttr(openTag, 'src');
+      if (srcAttr) {
+        let cut = srcAttr.start;
+        while (cut > 0 && /\s/.test(openTag[cut - 1])) cut--;
+        openTag = openTag.slice(0, cut) + openTag.slice(srcAttr.end);
+      }
+      return `${openTag}${js}</script>`;
+    } catch (err) {
+      if (err && err.code === 'VEIL_NOT_UTF8') throw err;
+      warn(src, 'could not read script; the reference will be blocked by the page CSP');
+      return null;
+    }
+  };
+
+  // One walk applies both passes. A script is inlined only when its body is
+  // empty and it is closed — a body would otherwise be lost — so its span
+  // covers the closing tag; anything left is reported by the sweep below.
+  {
+    let out = '';
+    let last = 0;
+    for (const token of scanTags(html)) {
+      let replacement = null;
+      let spanEnd = token.end;
+      if (token.name === 'link') {
+        replacement = inlineLink(token.tag);
+      } else if (token.name === 'script' && token.closeEnd !== null && html.slice(token.end, token.rawEnd).trim() === '') {
+        replacement = inlineScript(token.tag);
+        spanEnd = token.closeEnd;
+      }
+      if (replacement === null) continue;
+      out += html.slice(last, token.start) + replacement;
+      last = spanEnd;
+    }
+    html = out + html.slice(last);
+  }
+
+  // Whatever survived both passes — a tag with a body, an unreadable file, a
+  // module — still loads a script by URL, which the page CSP forbids. One
+  // sweep over the transformed page catches them all, skipping resources a
+  // more specific warning already covered.
+  warnings.push(...scanBlockedScripts(html, pageRelPath, new Set(warnings.map((w) => w.url))));
+
+  return { html, inlined, inlinedScripts, kept, warnings };
+}
+
+/**
+ * Report every <script src> left in a page: the wrapper CSP allows inline
+ * scripts only, so any surviving reference is dead. Open tags only — a tag's
+ * body has no bearing on whether its src is blocked.
+ */
+function scanBlockedScripts(html, pageRelPath, seenUrls = new Set()) {
+  const warnings = [];
+  for (const token of scanTags(html)) {
+    if (token.name !== 'script') continue;
+    const src = getAttr(token.tag, 'src');
+    if (src && !seenUrls.has(src)) {
+      seenUrls.add(src);
+      warnings.push({
+        page: pageRelPath,
+        url: src,
+        reason: 'script src remains in the page and will be blocked by the page CSP',
+      });
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Collect local asset paths referenced by a passthrough (public) HTML file.
+ * Used to decide which inlined assets must still be copied. Deliberately
+ * broad — any link href or script src counts as a reference.
+ */
+function collectLocalRefs(html, pageRelPath, inputRoot) {
+  const refs = new Set();
+  const htmlDir = path.dirname(path.join(inputRoot, pageRelPath));
+  const add = (url) => {
+    const { pathPart } = splitUrl(url);
+    if (pathPart === '' || isExternalUrl(pathPart)) return;
+    const real = resolveAssetPath(htmlDir, pathPart, inputRoot);
+    if (real) refs.add(real);
+  };
+  const scan = (fragment) => {
+    for (const token of scanTags(fragment)) {
+      if (token.name === 'link') {
+        const href = getAttr(token.tag, 'href');
+        if (href) add(href);
+      } else if (token.name === 'script') {
+        const src = getAttr(token.tag, 'src');
+        if (src) add(src);
+      } else if (token.name === 'noscript' && token.rawEnd !== undefined) {
+        // A scripting-disabled browser parses noscript content as markup;
+        // keep any fallback assets it references.
+        scan(fragment.slice(token.end, token.rawEnd));
       }
     }
-  );
-
-  return html;
+  };
+  scan(html);
+  return refs;
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +1155,11 @@ function isHtmlFile(name) {
   return /\.html?$/i.test(name);
 }
 
+/** Case-insensitive JavaScript file classification (classic, ESM, CommonJS). */
+function isJsFile(name) {
+  return /\.(m|c)?js$/i.test(name);
+}
+
 /**
  * Recursively collect all files under dir, returning paths relative to dir.
  * Symlinks and special files are rejected: silently skipping them (the old
@@ -820,14 +1373,6 @@ async function main() {
   // -- Build into a staging directory, publish only on success -------------
 
   const publicHtmlFiles = passthroughFiles.filter(isHtmlFile);
-  const publicOtherFiles = passthroughFiles.filter((f) => !isHtmlFile(f));
-
-  if (publicOtherFiles.length > 0) {
-    console.warn(`veil: copying ${publicOtherFiles.length} non-HTML file(s) unencrypted — these remain public`);
-  }
-  if (publicHtmlFiles.length > 0) {
-    console.warn(`veil: leaving ${publicHtmlFiles.length} HTML file(s) public outside the encrypted roots`);
-  }
 
   ensureDir(path.dirname(opts.outputDir));
   const stagingDir = fs.mkdtempSync(`${opts.outputDir}.veil-tmp-`);
@@ -839,20 +1384,30 @@ async function main() {
     // traverse it.
     fs.chmodSync(stagingDir, 0o777 & ~process.umask());
 
-    for (const file of passthroughFiles) {
-      copyFile(
-        path.join(opts.inputDir, file),
-        path.join(stagingDir, file)
-      );
-    }
+    // Process HTML files first: inline assets, encrypt, generate wrapper.
+    // The inline report decides below which assets need copying at all.
+    const inlinedAssets = new Set();
+    const inlinedScripts = new Set();
+    const keptAssets = new Set();
+    const inlineWarnings = [];
 
-    // Process HTML files: inline assets, encrypt, generate wrapper
     for (const file of htmlFiles) {
       const src = path.join(opts.inputDir, file);
-      let html = fs.readFileSync(src, 'utf8');
+      let html = readUtf8(src, file);
 
       if (opts.inline) {
-        html = inlineAssets(html, path.dirname(src), opts.inputDir);
+        const res = inlineAssets(html, file, opts.inputDir);
+        html = res.html;
+        for (const p of res.inlined) inlinedAssets.add(p);
+        for (const p of res.inlinedScripts) inlinedScripts.add(p);
+        for (const p of res.kept) keptAssets.add(p);
+        // Anything the transformed page still points at — preload/icon links,
+        // module or unreadable scripts — is fetched at runtime by the
+        // decrypted page and must stay in the public output.
+        for (const p of collectLocalRefs(html, file, opts.inputDir)) keptAssets.add(p);
+        inlineWarnings.push(...res.warnings);
+      } else {
+        inlineWarnings.push(...scanBlockedScripts(html, file));
       }
 
       // Encrypt the page
@@ -874,6 +1429,106 @@ async function main() {
       const dest = path.join(stagingDir, file);
       ensureDir(path.dirname(dest));
       fs.writeFileSync(dest, wrapper);
+    }
+
+    const seenWarnings = new Set();
+    for (const w of inlineWarnings) {
+      const key = `${w.page}|${w.url}|${w.reason}`;
+      if (seenWarnings.has(key)) continue;
+      seenWarnings.add(key);
+      console.warn(`veil: warning: ${w.page}: ${w.url}: ${w.reason}`);
+    }
+
+    // An asset whose contents were inlined into encrypted pages is only
+    // omitted from the public output when nothing left can reach it: no
+    // public HTML tag, no public stylesheet or inline <style>, and no
+    // reference that survived inlining on a protected page. Anything
+    // uncertain is copied.
+    const realOf = (file) => {
+      try {
+        return fs.realpathSync(path.join(opts.inputDir, file));
+      } catch {
+        return null;
+      }
+    };
+    const omit = new Set();
+    if (opts.inline && inlinedAssets.size > 0) {
+      const publicRefs = new Set();
+      for (const file of publicHtmlFiles) {
+        const html = fs.readFileSync(path.join(opts.inputDir, file), 'utf8');
+        const htmlDir = path.dirname(path.join(opts.inputDir, file));
+        for (const p of collectLocalRefs(html, file, opts.inputDir)) publicRefs.add(p);
+        html.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, (m, body) => {
+          for (const p of collectCssRefs(body, htmlDir, opts.inputDir)) publicRefs.add(p);
+          return m;
+        });
+      }
+      // Every passthrough stylesheet is scanned, not just the ones a public
+      // page links: that covers css → css → css import chains without
+      // recursing, since each file in the chain is scanned on its own.
+      for (const file of passthroughFiles) {
+        if (!/\.css$/i.test(file)) continue;
+        let css;
+        try {
+          css = fs.readFileSync(path.join(opts.inputDir, file), 'utf8');
+        } catch {
+          continue;
+        }
+        const cssDir = path.dirname(path.join(opts.inputDir, file));
+        for (const p of collectCssRefs(css, cssDir, opts.inputDir)) publicRefs.add(p);
+      }
+      // Public JS can import anything, and a public page can load it from an
+      // inline event handler no scanner sees — so an inlined JS file is only
+      // omitted when the whole site is encrypted (no public HTML at all) and
+      // no JavaScript survives publicly. CSS needs no such rule; the scans
+      // above follow every reference a stylesheet can make.
+      const unreachable = (real) =>
+        !!real && inlinedAssets.has(real) && !keptAssets.has(real) && !publicRefs.has(real);
+      // A file is JavaScript when a protected page consumed it as a script —
+      // an extensionless handler still is — or when its name says so, which
+      // also catches passthrough JS that no page inlined.
+      const isJs = (real, name) => (!!real && inlinedScripts.has(real)) || isJsFile(name);
+      const keepInlinedJs =
+        publicHtmlFiles.length > 0 ||
+        passthroughFiles.some((f) => {
+          const real = realOf(f);
+          return isJs(real, f) && !unreachable(real);
+        });
+      for (const p of inlinedAssets) {
+        if (!unreachable(p)) continue;
+        if (keepInlinedJs && isJs(p, p)) continue;
+        omit.add(p);
+      }
+    }
+
+    const toCopy = [];
+    let omittedCount = 0;
+    for (const file of passthroughFiles) {
+      const real = realOf(file);
+      if (real && omit.has(real)) {
+        omittedCount++;
+        continue;
+      }
+      toCopy.push(file);
+    }
+
+    const copyOther = toCopy.filter((f) => !isHtmlFile(f));
+    const copyHtml = toCopy.filter(isHtmlFile);
+    if (omittedCount > 0) {
+      console.log(`veil: omitting ${omittedCount} asset(s) that were inlined into encrypted pages and are not referenced by public files`);
+    }
+    if (copyOther.length > 0) {
+      console.warn(`veil: copying ${copyOther.length} non-HTML file(s) unencrypted — these remain public`);
+    }
+    if (copyHtml.length > 0) {
+      console.warn(`veil: leaving ${copyHtml.length} HTML file(s) public outside the encrypted roots`);
+    }
+
+    for (const file of toCopy) {
+      copyFile(
+        path.join(opts.inputDir, file),
+        path.join(stagingDir, file)
+      );
     }
 
     publishOutput(stagingDir, opts.outputDir, opts.force);

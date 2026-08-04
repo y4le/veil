@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { spawnSync } = require('child_process');
 
 const VEIL = path.join(__dirname, 'veil.js');
 
@@ -15,21 +15,18 @@ function tmpDir() {
 }
 
 function run(args, opts = {}) {
-  try {
-    const stdout = execFileSync(process.execPath, [VEIL, ...args], {
-      encoding: 'utf8',
-      timeout: 30000,
-      ...opts,
-    });
-    return { stdout, stderr: '', code: 0 };
-  } catch (err) {
-    return { stdout: err.stdout || '', stderr: err.stderr || '', code: err.status };
-  }
+  const r = spawnSync(process.execPath, [VEIL, ...args], {
+    encoding: 'utf8',
+    timeout: 30000,
+    ...opts,
+  });
+  return { stdout: r.stdout || '', stderr: r.stderr || '', code: r.status };
 }
 
 function setupSite(dir, files) {
-  const siteDir = path.join(dir, 'site');
-  fs.mkdirSync(siteDir, { recursive: true });
+  // A fresh directory per call: shared fixture dirs let files from earlier
+  // tests leak into later ones and make results order-dependent.
+  const siteDir = fs.mkdtempSync(path.join(dir, 'site-'));
   for (const [name, content] of Object.entries(files)) {
     const filePath = path.join(siteDir, name);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -415,6 +412,214 @@ describe('asset inlining', () => {
     assert.match(html, /<style media="print">/);
   });
 
+  it('inlines root-relative CSS and JS', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html':
+        '<html><head><link rel="stylesheet" href="/rootstyle.css"></head>' +
+        '<body><script src="/lib/rootapp.js"></script></body></html>',
+      'rootstyle.css': 'body{color:teal}',
+      'lib/rootapp.js': 'var rootApp = 1;',
+    });
+    const outDir = path.join(dir, 'out-rootrel');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /color:teal/);
+    assert.match(html, /var rootApp = 1/);
+    assert.ok(!html.includes('href="/rootstyle.css"'));
+    assert.ok(!html.includes('src="/lib/rootapp.js"'));
+  });
+
+  it('inlines unquoted attribute references', () => {
+    const siteDir = setupSite(dir, {
+      'unq.html':
+        '<html><head><link rel=stylesheet href=unq.css></head>' +
+        '<body><script src=unq.js></script></body></html>',
+      'unq.css': 'body{color:olive}',
+      'unq.js': 'var unq = 1;',
+    });
+    const outDir = path.join(dir, 'out-unquoted');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'unq.html'), 'utf8')), 'test');
+    assert.match(html, /color:olive/);
+    assert.match(html, /var unq = 1/);
+  });
+
+  it('inlines percent-encoded references', () => {
+    const siteDir = setupSite(dir, {
+      'enc.html': '<html><head><link rel="stylesheet" href="my%20style.css"></head><body>x</body></html>',
+      'my style.css': 'body{color:navy}',
+    });
+    const outDir = path.join(dir, 'out-encoded');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'enc.html'), 'utf8')), 'test');
+    assert.match(html, /color:navy/);
+  });
+
+  it('escapes </style> sequences in inlined CSS', () => {
+    const siteDir = setupSite(dir, {
+      'esc.html': '<html><head><link rel="stylesheet" href="esc.css"></head><body>x</body></html>',
+      'esc.css': 'i::before{content:"</style><script>alert(1)</script>"}',
+    });
+    const outDir = path.join(dir, 'out-styleesc');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'esc.html'), 'utf8')), 'test');
+    assert.ok(!html.includes('</style><script>alert(1)'), 'CSS must not break out of its style tag');
+    assert.match(html, /<\\\/style>/);
+  });
+
+  it('rewrites relative and root-relative url() and @import in inlined CSS', () => {
+    const siteDir = setupSite(dir, {
+      'trip/web/page.html': '<html><head><link rel="stylesheet" href="../../assets/deep.css"></head><body>x</body></html>',
+      'assets/deep.css':
+        '@import "theme/base.css";\n' +
+        'body{background:url(bg.png?v=2)}\n' +
+        'h1{background:url("/logo.png")}\n' +
+        'p{background:url(https://cdn.example.com/x.png)}',
+      'assets/theme/base.css': 'b{}',
+      'assets/bg.png': 'png',
+      'logo.png': 'png',
+    });
+    const outDir = path.join(dir, 'out-cssurl');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'trip/web/page.html'), 'utf8')), 'test');
+    assert.match(html, /@import "\.\.\/\.\.\/assets\/theme\/base\.css"/);
+    assert.match(html, /url\("\.\.\/\.\.\/assets\/bg\.png\?v=2"\)/);
+    assert.match(html, /url\("\.\.\/\.\.\/logo\.png"\)/);
+    assert.match(html, /url\(https:\/\/cdn\.example\.com\/x\.png\)/, 'external url() must be untouched');
+    // url()/@import targets must still exist in the output
+    assert.ok(fs.existsSync(path.join(outDir, 'assets/theme/base.css')));
+    assert.ok(fs.existsSync(path.join(outDir, 'assets/bg.png')));
+    assert.ok(fs.existsSync(path.join(outDir, 'logo.png')));
+  });
+
+  it('omits inlined CSS that public files do not reference', () => {
+    const siteDir = setupSite(dir, {
+      'secret/page.html': '<html><head><link rel="stylesheet" href="only.css"></head><body><script src="only.js"></script></body></html>',
+      'secret/only.css': 'body{color:red}',
+      'secret/only.js': 'var only = 1;',
+      'public.html': '<html><head><link rel="stylesheet" href="shared.css"></head><body>pub</body></html>',
+      'shared.css': 'body{color:green}',
+    });
+    const outDir = path.join(dir, 'out-omit');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    assert.ok(!fs.existsSync(path.join(outDir, 'secret/only.css')), 'inlined-only CSS must not be published');
+    assert.ok(fs.existsSync(path.join(outDir, 'secret/only.js')), 'inlined JS stays published while any public HTML remains');
+    assert.ok(fs.existsSync(path.join(outDir, 'shared.css')), 'public-referenced CSS must be published');
+    assert.match(r.stdout, /omitting 1 asset/);
+  });
+
+  it('omits inlined JS when the whole site is encrypted', () => {
+    const siteDir = setupSite(dir, {
+      'index.html': '<html><head><link rel="stylesheet" href="only2.css"></head><body><script src="only2.js"></script></body></html>',
+      'only2.css': 'body{color:red}',
+      'only2.js': 'var only2 = 1;',
+    });
+    const outDir = path.join(dir, 'out-omit-full');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    assert.ok(!fs.existsSync(path.join(outDir, 'only2.css')));
+    assert.ok(!fs.existsSync(path.join(outDir, 'only2.js')), 'inlined JS is omitted once no public HTML remains');
+    assert.match(r.stdout, /omitting 2 asset/);
+  });
+
+  it('keeps inlined JS that a public inline event handler could load', () => {
+    const siteDir = setupSite(dir, {
+      'secret/page.html': '<html><body><script src="/handler.js"></script></body></html>',
+      'handler.js': 'var handler = 1;',
+      'public.html': '<html><body onclick="import(\'./handler.js\')">pub</body></html>',
+    });
+    const outDir = path.join(dir, 'out-onclick');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    assert.ok(fs.existsSync(path.join(outDir, 'handler.js')), 'JS an inline handler could import must be published');
+    assert.ok(!r.stdout.includes('omitting'));
+  });
+
+  it('keeps an inlined extensionless script that a public inline handler could load', () => {
+    const siteDir = setupSite(dir, {
+      'secret/page.html': '<html><body><script src="/handler"></script></body></html>',
+      'handler': 'var handler = 1;',
+      'public.html': '<html><body onclick="import(\'./handler\')">pub</body></html>',
+    });
+    const outDir = path.join(dir, 'out-onclick-noext');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'secret/page.html'), 'utf8')), 'test');
+    assert.match(html, /var handler = 1/, 'the extensionless script must still be inlined');
+    assert.ok(fs.existsSync(path.join(outDir, 'handler')), 'a file inlined as JS must be published like any other JS');
+    assert.ok(!r.stdout.includes('omitting'));
+  });
+
+  it('keeps an inlined asset that another protected page references as a module', () => {
+    const siteDir = setupSite(dir, {
+      'one.html': '<html><body><script src="app.js"></script></body></html>',
+      'two.html': '<html><body><script type="module" src="app.js"></script></body></html>',
+      'app.js': 'var dual = 1;',
+    });
+    const outDir = path.join(dir, 'out-dualref');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    assert.ok(fs.existsSync(path.join(outDir, 'app.js')), 'module-referenced asset must stay published');
+    assert.match(r.stderr, /module script cannot be inlined/);
+  });
+
+  it('warns about references it leaves in the page', () => {
+    const siteDir = setupSite(dir, {
+      'warn.html':
+        '<html><head><link rel="stylesheet" href="missing.css"></head>' +
+        '<body><script src="https://cdn.example.com/lib.js"></script></body></html>',
+    });
+    const outDir = path.join(dir, 'out-warn');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.match(r.stderr, /warn\.html: missing\.css: stylesheet not found/);
+    assert.match(r.stderr, /warn\.html: https:\/\/cdn\.example\.com\/lib\.js: external script will be blocked/);
+  });
+
+  it('warns that --no-inline leaves script src blocked', () => {
+    const siteDir = setupSite(dir, {
+      'ni.html': '<html><body><script src="local.js"></script></body></html>',
+      'local.js': 'var x = 1;',
+    });
+    const outDir = path.join(dir, 'out-ni-warn');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--no-inline']);
+    assert.match(r.stderr, /ni\.html: local\.js: script src remains in the page and will be blocked by the page CSP/);
+  });
+
+  it('rejects non-UTF-8 HTML input and leaves no output behind', () => {
+    const siteDir = setupSite(dir, {
+      'good.html': '<html><body>ok</body></html>',
+      'bad.html': Buffer.concat([Buffer.from('<html><body>'), Buffer.from([0xff, 0xfe, 0x80]), Buffer.from('</body></html>')]),
+    });
+    const outDir = path.join(dir, 'out-notutf8');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /not valid UTF-8: bad\.html/);
+    assert.ok(!fs.existsSync(outDir));
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => f.startsWith('out-notutf8.veil-')), []);
+  });
+
+  it('rejects non-UTF-8 inlined CSS', () => {
+    const siteDir = setupSite(dir, {
+      'latin.html': '<html><head><link rel="stylesheet" href="latin1.css"></head><body>x</body></html>',
+      'latin1.css': Buffer.from([0x62, 0x6f, 0x64, 0x79, 0x7b, 0x7d, 0x2f, 0x2a, 0xe9, 0x2a, 0x2f]),
+    });
+    const outDir = path.join(dir, 'out-notutf8-css');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /not valid UTF-8: latin1\.css \(inlined by latin\.html\)/);
+  });
+
+  it('round-trips non-ASCII UTF-8 content exactly', () => {
+    const original = '<html><head><title>Café ☕</title></head><body>中文 émoji 🎉</body></html>';
+    const siteDir = setupSite(dir, { 'utf8.html': original });
+    const outDir = path.join(dir, 'out-utf8');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'utf8.html'), 'utf8')), 'test');
+    assert.equal(html, original);
+  });
+
   it('inlines assets outside the encrypted subtree when input root is wider', () => {
     const siteDir = setupSite(dir, {
       'index.html': '<html><body>public</body></html>',
@@ -428,6 +633,396 @@ describe('asset inlining', () => {
     assert.match(html, /body\{color:green\}/);
     assert.match(html, /window\.tripLoaded = true/);
     assert.ok(!html.includes('href="../../assets/travel.css"'));
+  });
+
+  it('removes only the src attribute when inlining a script', () => {
+    const siteDir = setupSite(dir, {
+      'ds.html': '<html><body><script data-src="lazy.js" src="app.js"></script></body></html>',
+      'app.js': 'var inlinedApp = 1;',
+      'lazy.js': 'var lazy = 1;',
+    });
+    const outDir = path.join(dir, 'out-datasrc');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'ds.html'), 'utf8')), 'test');
+    assert.match(html, /var inlinedApp = 1/);
+    assert.ok(!html.includes('src="app.js"'), 'inlined src must be gone');
+    assert.match(html, /data-src="lazy\.js"/, 'data-src must survive intact');
+    assert.ok(fs.existsSync(path.join(outDir, 'lazy.js')), 'unrelated asset must still be published');
+  });
+
+  it('ignores attribute-like text inside another attribute value', () => {
+    const siteDir = setupSite(dir, {
+      'dec.html': '<html><body><script data-x="src=\'decoy.js\'" src="real.js"></script></body></html>',
+      'real.js': 'var real = 1;',
+      'decoy.js': 'var decoy = 1;',
+    });
+    const outDir = path.join(dir, 'out-decoy');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'dec.html'), 'utf8')), 'test');
+    assert.match(html, /var real = 1/);
+    assert.ok(!html.includes('real.js'), 'the real script reference must be gone');
+    assert.match(html, /data-x="src='decoy\.js'"/, 'the decoy attribute must be untouched');
+    assert.equal(fs.readFileSync(path.join(outDir, 'decoy.js'), 'utf8'), 'var decoy = 1;');
+  });
+
+  it('ignores tag-shaped text in attributes, comments, and script bodies', () => {
+    const decoy = '<link rel="stylesheet" href="fake.css">';
+    const siteDir = setupSite(dir, {
+      'tok.html':
+        '<html><head><link rel="stylesheet" href="realtok.css">' +
+        `<!-- <p>disabled</p> ${decoy} -->` +
+        `</head><body><div data-template='${decoy}'>d</div>` +
+        `<script>const tpl='${decoy}';</script>` +
+        '<script src="realtok.js"></script></body></html>',
+      'realtok.css': 'body{color:maroon}',
+      'realtok.js': 'var realTok = 1;',
+      'fake.css': ".q::before{content:'x'}",
+    });
+    const outDir = path.join(dir, 'out-tokenizer');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'tok.html'), 'utf8')), 'test');
+    assert.ok(html.includes(`<!-- <p>disabled</p> ${decoy} -->`), 'a comment must be byte-identical');
+    assert.ok(html.includes(`<div data-template='${decoy}'>`), 'an attribute value must be byte-identical');
+    assert.ok(html.includes(`<script>const tpl='${decoy}';</script>`), 'a script body must be byte-identical');
+    assert.ok(!html.includes("content:'x'"), 'the decoy stylesheet must never be inlined');
+    assert.match(html, /<style>body\{color:maroon\}<\/style>/, 'the real link must still be inlined');
+    assert.match(html, /var realTok = 1/, 'the real script must still be inlined');
+    assert.ok(fs.existsSync(path.join(outDir, 'fake.css')), 'the decoy target must not be treated as inlined');
+  });
+
+  it('leaves protected-page noscript content byte-identical', () => {
+    // With scripting enabled (always true on a decrypted Veil page) noscript
+    // content is raw text ending at the first </noscript>. Inlining inside it
+    // could push author bytes out into active markup: fallback.css below
+    // contains a CSS string with "</noscript>" that must never become a tag.
+    const noscriptBlock = '<noscript><link rel="stylesheet" href="fallback.css"></noscript>';
+    const siteDir = setupSite(dir, {
+      'ns.html': `<html><head>${noscriptBlock}<link rel="stylesheet" href="real.css"></head><body>x</body></html>`,
+      'fallback.css': '.x{content:"</noscript><div id=escaped>escaped</div>"}',
+      'real.css': 'body{color:crimson}',
+    });
+    const outDir = path.join(dir, 'out-noscript');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'ns.html'), 'utf8')), 'test');
+    assert.ok(html.includes(noscriptBlock), 'noscript content must be byte-identical');
+    assert.ok(!html.includes('id=escaped'), 'CSS bytes must not escape into markup');
+    assert.match(html, /color:crimson/, 'real link outside noscript still inlines');
+    assert.ok(fs.existsSync(path.join(outDir, 'fallback.css')), 'noscript fallback asset must stay published');
+  });
+
+  it('keeps assets referenced only from public noscript blocks', () => {
+    const siteDir = setupSite(dir, {
+      'secret/page.html': '<html><head><link rel="stylesheet" href="../fb.css"></head><body>x</body></html>',
+      'public.html': '<html><head><noscript><link rel="stylesheet" href="fb.css"></noscript></head><body>pub</body></html>',
+      'fb.css': 'body{color:plum}',
+    });
+    const outDir = path.join(dir, 'out-noscript-pub');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    assert.ok(fs.existsSync(path.join(outDir, 'fb.css')), 'public noscript reference must keep the asset');
+  });
+
+  it('treats textarea content as text, not markup', () => {
+    const decoy = '<link rel="stylesheet" href="tafake.css">';
+    const siteDir = setupSite(dir, {
+      'ta.html':
+        `<html><head><link rel="stylesheet" href="tareal.css"></head>` +
+        `<body><textarea>${decoy}</textarea></body></html>`,
+      'tareal.css': 'body{color:purple}',
+      'tafake.css': ".q::before{content:'ta'}",
+    });
+    const outDir = path.join(dir, 'out-textarea');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'ta.html'), 'utf8')), 'test');
+    assert.ok(html.includes(`<textarea>${decoy}</textarea>`), 'textarea content must be byte-identical');
+    assert.match(html, /<style>body\{color:purple\}<\/style>/, 'the real link must still be inlined');
+    assert.ok(fs.existsSync(path.join(outDir, 'tafake.css')), 'the decoy target must not be treated as inlined');
+  });
+
+  it('treats title content as text, not markup', () => {
+    const decoy = '<link rel="stylesheet" href="tifake.css">';
+    const siteDir = setupSite(dir, {
+      'ti.html':
+        `<html><head><title>${decoy}</title>` +
+        `<link rel="stylesheet" href="tireal.css"></head><body>x</body></html>`,
+      'tireal.css': 'body{color:olive}',
+      'tifake.css': ".q::before{content:'ti'}",
+    });
+    const outDir = path.join(dir, 'out-title');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'ti.html'), 'utf8')), 'test');
+    assert.ok(html.includes(`<title>${decoy}</title>`), 'title content must be byte-identical');
+    assert.match(html, /<style>body\{color:olive\}<\/style>/, 'the real link must still be inlined');
+    assert.ok(fs.existsSync(path.join(outDir, 'tifake.css')), 'the decoy target must not be treated as inlined');
+  });
+
+  it('treats raw-text elements and text after <plaintext> as text', () => {
+    const decoy = '<link rel="stylesheet" href="rawfake.css">';
+    const body = `<xmp>${decoy}</xmp><noframes>${decoy}</noframes><plaintext>${decoy}`;
+    const siteDir = setupSite(dir, {
+      'raw.html':
+        `<html><head><link rel="stylesheet" href="rawreal.css"></head><body>${body}</body></html>`,
+      'rawreal.css': 'body{color:navy}',
+      'rawfake.css': ".q::before{content:'raw'}",
+    });
+    const outDir = path.join(dir, 'out-rawtext');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'raw.html'), 'utf8')), 'test');
+    assert.ok(html.includes(body), 'raw-text and plaintext content must be byte-identical');
+    assert.match(html, /<style>body\{color:navy\}<\/style>/, 'the real link must still be inlined');
+    assert.ok(fs.existsSync(path.join(outDir, 'rawfake.css')), 'the decoy target must not be treated as inlined');
+  });
+
+  it('publishes assets reachable through public CSS @import chains', () => {
+    const siteDir = setupSite(dir, {
+      'secret/page.html':
+        '<html><head><link rel="stylesheet" href="/shared.css">' +
+        '<link rel="stylesheet" href="/b.css"></head><body>x</body></html>',
+      'shared.css': 'body{color:red}',
+      'b.css': 'p{color:blue}',
+      'a.css': '@import "b.css";',
+      'public.css': '@import "shared.css";\n@import "a.css";',
+      'public.html': '<html><head><link rel="stylesheet" href="public.css"></head><body>pub</body></html>',
+    });
+    const outDir = path.join(dir, 'out-cssimport');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    assert.ok(fs.existsSync(path.join(outDir, 'shared.css')), 'CSS imported by a public stylesheet must be published');
+    assert.ok(fs.existsSync(path.join(outDir, 'b.css')), 'CSS reachable through an import chain must be published');
+  });
+
+  it('publishes assets referenced by an inline <style> in a public page', () => {
+    const siteDir = setupSite(dir, {
+      'secret/page.html': '<html><head><link rel="stylesheet" href="/theme.css"></head><body>x</body></html>',
+      'theme.css': 'body{background:url(/pattern.png)}',
+      'pattern.png': 'png',
+      'public.html': '<html><head><style>@import "theme.css";</style></head><body>pub</body></html>',
+    });
+    const outDir = path.join(dir, 'out-inlinestyle');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    assert.ok(fs.existsSync(path.join(outDir, 'theme.css')), 'CSS imported by an inline <style> must be published');
+  });
+
+  it('leaves CSS strings and comments untouched while rewriting real urls', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/lex.css"></head><body>x</body></html>',
+      'css/lex.css':
+        '.x::before{content:"url(icon.png)"}\n' +
+        '/* url(fake.png) and @import "fake.css"; */\n' +
+        '.y{background:url(real.png)}\n' +
+        '@font-face{src:url(font.woff) format("woff")}',
+      'css/real.png': 'png',
+      'css/font.woff': 'woff',
+    });
+    const outDir = path.join(dir, 'out-csslex');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /\.x::before\{content:"url\(icon\.png\)"\}/, 'string literal must be byte-identical');
+    assert.match(html, /\/\* url\(fake\.png\) and @import "fake\.css"; \*\//, 'comment must be byte-identical');
+    assert.match(html, /url\("\.\.\/css\/real\.png"\)/, 'real url\\(\\) must be rewritten');
+    assert.match(html, /url\("\.\.\/css\/font\.woff"\) format\("woff"\)/);
+    for (const noise of ['icon.png', 'fake.png', 'fake.css']) {
+      assert.ok(!r.stderr.includes(noise), `${noise} must not be treated as a reference`);
+    }
+  });
+
+  it('percent-encodes rewritten CSS paths and keeps the query and fragment', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/enc.css"></head><body>x</body></html>',
+      'css/enc.css': '.i{background:url("icon%23x.png?v=1#frag")}',
+      'css/icon#x.png': 'png',
+    });
+    const outDir = path.join(dir, 'out-cssenc');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /url\("\.\.\/css\/icon%23x\.png\?v=1#frag"\)/);
+    assert.ok(fs.existsSync(path.join(outDir, 'css/icon#x.png')), 'the referenced file must be published');
+  });
+
+  it('warns about a script src with a body and keeps the file published', () => {
+    const siteDir = setupSite(dir, {
+      'body.html': '<html><body><script src="app.js">fallback</script></body></html>',
+      'app.js': 'var app = 1;',
+    });
+    const outDir = path.join(dir, 'out-scriptbody');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    assert.match(r.stderr, /body\.html: app\.js: script src remains in the page and will be blocked by the page CSP/);
+    assert.ok(fs.existsSync(path.join(outDir, 'app.js')), 'a script that was not inlined must stay published');
+  });
+
+  it('warns about an external @import but not about external url()', () => {
+    const siteDir = setupSite(dir, {
+      'ext.html': '<html><head><link rel="stylesheet" href="ext.css"></head><body>x</body></html>',
+      'ext.css': '@import "https://cdn.example.com/theme.css";\nbody{background:url(https://cdn.example.com/bg.png)}',
+    });
+    const outDir = path.join(dir, 'out-extimport');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    assert.match(r.stderr, /ext\.css → https:\/\/cdn\.example\.com\/theme\.css: external CSS reference left as-is/);
+    assert.ok(!r.stderr.includes('bg.png'), 'external images must not be warned about');
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'ext.html'), 'utf8')), 'test');
+    assert.match(html, /@import "https:\/\/cdn\.example\.com\/theme\.css";/);
+  });
+
+  it('inlines tags whose earlier attribute value contains ">"', () => {
+    const siteDir = setupSite(dir, {
+      'gt.html':
+        '<html><head><link rel="stylesheet" title="x>y" href="gt.css"></head>' +
+        '<body><script data-note="a>b" src="gt.js"></script></body></html>',
+      'gt.css': 'body{color:fuchsia}',
+      'gt.js': 'var gtApp = 1;',
+    });
+    const outDir = path.join(dir, 'out-gt');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'gt.html'), 'utf8')), 'test');
+    assert.match(html, /<style>body\{color:fuchsia\}/);
+    assert.ok(!html.includes('href="gt.css"'), 'the stylesheet reference must be gone');
+    assert.match(html, /var gtApp = 1/);
+    assert.ok(!html.includes('src="gt.js"'), 'the script reference must be gone');
+    assert.match(html, /data-note="a>b"/, 'the quoted ">" attribute must survive intact');
+  });
+
+  it('omits an asset inlined through a tag with a quoted ">" on every page', () => {
+    const siteDir = setupSite(dir, {
+      'secret/a.html': '<html><body><script src="/gtshared.js"></script></body></html>',
+      'secret/b.html': '<html><body><script data-note="a>b" src="/gtshared.js"></script></body></html>',
+      'gtshared.js': 'var gtShared = 1;',
+    });
+    const outDir = path.join(dir, 'out-gt-omit');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'secret/b.html'), 'utf8')), 'test');
+    assert.match(html, /var gtShared = 1/, 'the truncated tag must still be inlined');
+    assert.ok(!html.includes('src="/gtshared.js"'));
+    assert.ok(!fs.existsSync(path.join(outDir, 'gtshared.js')), 'inlined-everywhere JS must not be published');
+    assert.match(r.stdout, /omitting 1 asset/);
+  });
+
+  it('keeps inlined JS when public JavaScript could import it', () => {
+    const siteDir = setupSite(dir, {
+      'secret/page.html':
+        '<html><head><link rel="stylesheet" href="/priv.css"></head>' +
+        '<body><script src="/shared.js"></script></body></html>',
+      'shared.js': 'var shared = 1;',
+      'priv.css': 'body{color:red}',
+      'public.html': '<html><body><script type="module" src="public.js"></script></body></html>',
+      'public.js': 'import "./shared.js";',
+    });
+    const outDir = path.join(dir, 'out-publicjs');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000', '--html-root', 'secret']);
+    assert.equal(r.code, 0);
+    assert.ok(fs.existsSync(path.join(outDir, 'shared.js')), 'JS a public module could import must be published');
+    assert.ok(fs.existsSync(path.join(outDir, 'public.js')));
+    assert.ok(!fs.existsSync(path.join(outDir, 'priv.css')), 'unreferenced inlined CSS is still omitted');
+    assert.match(r.stdout, /omitting 1 asset/);
+  });
+
+  it('resolves CSS escapes when rewriting url() references', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/esc.css"></head><body>x</body></html>',
+      'css/esc.css': '.a{background:url("my\\ icon.png")}\n.b{background:url(my\\ icon.png)}',
+      'css/my icon.png': 'png',
+    });
+    const outDir = path.join(dir, 'out-cssescape');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    const hits = html.match(/url\("\.\.\/css\/my%20icon\.png"\)/g) || [];
+    assert.equal(hits.length, 2, 'quoted and unquoted escaped urls must both be rewritten');
+    assert.ok(fs.existsSync(path.join(outDir, 'css/my icon.png')), 'the escaped reference must be published');
+  });
+
+  it('resolves a hex escape in an unquoted url()', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/hex.css"></head><body>x</body></html>',
+      'css/hex.css': '.a{background:url(my\\20 icon.png)}',
+      'css/my icon.png': 'png',
+    });
+    const outDir = path.join(dir, 'out-csshex');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /url\("\.\.\/css\/my%20icon\.png"\)/);
+    assert.ok(fs.existsSync(path.join(outDir, 'css/my icon.png')), 'the escaped reference must be published');
+  });
+
+  it('treats CRLF after a hex escape as one terminator', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/crlf.css"></head><body>x</body></html>',
+      'css/crlf.css': '.a{background:url(my\\20\r\nicon.png)}',
+      'css/my icon.png': 'png',
+    });
+    const outDir = path.join(dir, 'out-csscrlf');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /url\("\.\.\/css\/my%20icon\.png"\)/);
+    assert.ok(fs.existsSync(path.join(outDir, 'css/my icon.png')), 'the escaped reference must be published');
+  });
+
+  it('treats an escaped newline in a url string as a line continuation', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/cont.css"></head><body>x</body></html>',
+      'css/cont.css': '.a{background:url("my\\\nicon.png")}',
+      'css/myicon.png': 'png',
+    });
+    const outDir = path.join(dir, 'out-csscont');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /url\("\.\.\/css\/myicon\.png"\)/);
+    assert.ok(fs.existsSync(path.join(outDir, 'css/myicon.png')), 'the continued reference must be published');
+  });
+
+  it('rewrites @import without a separator and ignores it inside a block', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/imp.css"></head><body>x</body></html>',
+      'css/imp.css':
+        '@import"a.css";\n' +
+        '@import/**/"b.css";\n' +
+        ':root{--x: @import "c.css";}\n' +
+        '@media print{@import "e.css";}',
+      'css/a.css': 'a{}',
+      'css/b.css': 'b{}',
+      'css/e.css': 'e{}',
+    });
+    const outDir = path.join(dir, 'out-importsep');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /@import"\.\.\/css\/a\.css";/);
+    assert.match(html, /@import\/\*\*\/"\.\.\/css\/b\.css";/);
+    assert.ok(html.includes(':root{--x: @import "c.css";}'), 'a declaration value must be byte-identical');
+    assert.ok(html.includes('@media print{@import "e.css";}'), 'a nested @import is invalid CSS and is left alone');
+    assert.ok(!r.stderr.includes('c.css'), 'a declaration value must not be treated as a reference');
+    assert.ok(fs.existsSync(path.join(outDir, 'css/a.css')));
+    assert.ok(fs.existsSync(path.join(outDir, 'css/b.css')));
+  });
+
+  it('escapes the query string of a rewritten url', () => {
+    const siteDir = setupSite(dir, {
+      'sub/page.html': '<html><head><link rel="stylesheet" href="../css/q.css"></head><body>x</body></html>',
+      'css/q.css': '.i{background:url("icon.png?q=\\"x\\"&y=(z)&n=\'")}',
+      'css/icon.png': 'png',
+    });
+    const outDir = path.join(dir, 'out-cssquery');
+    const r = run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    const html = decryptPayload(extractPayload(fs.readFileSync(path.join(outDir, 'sub/page.html'), 'utf8')), 'test');
+    assert.match(html, /url\("\.\.\/css\/icon\.png\?q=%22x%22&y=%28z%29&n=%27"\)/);
+    assert.ok(!html.includes('q="x"'), 'a raw quote must not survive inside the emitted url');
   });
 });
 

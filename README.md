@@ -23,12 +23,24 @@ Open `http://127.0.0.1:8765` — every page prompts for the passphrase, then dec
 
 ## How It Works
 
-1. Veil reads a directory of HTML files and inlines local CSS/JS into each page.
+1. Veil reads a directory of HTML files (UTF-8 required) and inlines local
+   CSS/JS into each page — relative or root-relative, quoted or unquoted
+   references. Relative `url()`/`@import` paths inside inlined CSS are
+   rewritten so they still resolve from the page. Scripts and stylesheets it
+   must leave in the page (external URLs, module scripts, missing files) are
+   reported with a build warning; cross-origin images and fonts referenced
+   from CSS are blocked by the page CSP too, but are not warned about
+   individually.
 2. It generates a random site master key, wraps it with a key derived from your passphrase (PBKDF2 + AES-256-GCM), and encrypts each HTML file with the master key.
 3. Each encrypted file is replaced with a self-contained wrapper that carries the ciphertext and a minimal unlock UI.
 4. In the browser, the wrapper derives the same key from the passphrase, unwraps the master key, decrypts the page, and caches the key for the session so other pages unlock automatically.
 
-Non-HTML files (images, fonts, data) are copied as-is. They remain public.
+Non-HTML files (images, fonts, data) are copied as-is and remain public —
+with one exception: a CSS/JS file that was inlined into encrypted pages and
+is referenced by nothing else is omitted from the output, so inlining
+actually shrinks the public surface. Inlined JS is only omitted when the
+whole site is encrypted (no public HTML) and no other JS survives publicly,
+since public pages and scripts can reach it in ways no scanner sees.
 
 Runtime behavior worth knowing:
 
