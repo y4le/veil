@@ -25,6 +25,7 @@ Options:
   --html-root <dir>     Encrypt only HTML under this input-relative dir (repeatable)
   --no-inline           Skip local CSS/JS inlining
   --force               Replace a non-empty output directory
+  --version             Print the veil version
   --help                Show this help
 
 The output directory is built fresh on every run: Veil stages the build in a
@@ -35,6 +36,27 @@ with --force.
   console.log(usage);
 }
 
+function readVersion() {
+  // veil.js is often vendored on its own, without the package it ships in.
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+    return pkg.version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * Read the value that follows an option. A value that looks like another
+ * option is treated as missing: `--id --force` is a forgotten argument, not a
+ * site id of "--force".
+ */
+function takeValue(args, i, flag) {
+  const val = args[i];
+  if (val === undefined || val.startsWith('-')) fatal(`${flag} requires a value`);
+  return val;
+}
+
 function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
@@ -43,7 +65,8 @@ function parseArgs(argv) {
     passphrase: null,
     passphraseEnv: null,
     siteId: null,
-    iterations: 600000,
+    siteIdInferred: false,
+    iterations: DEFAULT_ITERATIONS,
     remember: false,
     inline: true,
     force: false,
@@ -56,25 +79,30 @@ function parseArgs(argv) {
     if (arg === '--help' || arg === '-h') {
       printHelp();
       process.exit(0);
+    } else if (arg === '--version') {
+      console.log(`veil ${readVersion()}`);
+      process.exit(0);
     } else if (arg === '--passphrase') {
-      opts.passphrase = args[++i];
-      if (opts.passphrase === undefined) fatal('--passphrase requires a value');
+      opts.passphrase = takeValue(args, ++i, '--passphrase');
     } else if (arg === '--passphrase-env') {
-      opts.passphraseEnv = args[++i];
-      if (opts.passphraseEnv === undefined) fatal('--passphrase-env requires a value');
+      opts.passphraseEnv = takeValue(args, ++i, '--passphrase-env');
     } else if (arg === '--id') {
-      opts.siteId = args[++i];
-      if (opts.siteId === undefined) fatal('--id requires a value');
+      opts.siteId = takeValue(args, ++i, '--id');
+      // An empty id would collapse every such site into one storage
+      // namespace and violate the payload schema.
+      if (opts.siteId === '') fatal('--id must not be empty');
     } else if (arg === '--iterations') {
-      const val = parseInt(args[++i], 10);
-      if (isNaN(val) || val < 1) fatal('--iterations must be a positive integer');
-      opts.iterations = val;
+      const raw = takeValue(args, ++i, '--iterations');
+      // A full decimal integer only: "100000junk", "1e6" and "" are typos, and
+      // silently taking the leading digits would weaken the derivation.
+      if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+        fatal('--iterations must be a positive integer');
+      }
+      opts.iterations = Number(raw);
     } else if (arg === '--remember') {
       opts.remember = true;
     } else if (arg === '--html-root') {
-      const root = args[++i];
-      if (root === undefined) fatal('--html-root requires a value');
-      opts.htmlRoots.push(normalizeHtmlRoot(root));
+      opts.htmlRoots.push(normalizeHtmlRoot(takeValue(args, ++i, '--html-root')));
     } else if (arg === '--no-inline') {
       opts.inline = false;
     } else if (arg === '--force') {
@@ -90,15 +118,43 @@ function parseArgs(argv) {
     printHelp();
     process.exit(1);
   }
+  if (positional.length > 2) {
+    fatal(`Unexpected argument: ${positional[2]}`);
+  }
 
   opts.inputDir = path.resolve(positional[0]);
   opts.outputDir = path.resolve(positional[1]);
 
-  if (!opts.siteId) {
+  if (opts.siteId === null) {
     opts.siteId = path.basename(opts.outputDir);
+    opts.siteIdInferred = true;
   }
 
   return opts;
+}
+
+// Output directory names common enough that two different sites on one origin
+// would share storage keys if the id were inferred from them.
+const GENERIC_SITE_IDS = new Set([
+  'dist', 'build', 'public', 'out', 'output', 'site',
+  '_site', 'encrypted', '_encrypted', 'www', 'html',
+]);
+
+/**
+ * Non-fatal advice about choices that weaken or surprise. Emitted from main()
+ * so --help and --version stay clean, and before any filesystem work so the
+ * warning is visible even when the build fails later.
+ */
+function emitStartupWarnings(opts) {
+  if (opts.passphrase) {
+    warn('--passphrase is visible in process listings and shell history — prefer --passphrase-env or the interactive prompt');
+  }
+  if (opts.iterations < DEFAULT_ITERATIONS) {
+    warn(`${opts.iterations} PBKDF2 iterations is below the default ${DEFAULT_ITERATIONS} — weaker against offline guessing`);
+  }
+  if (opts.siteIdInferred && GENERIC_SITE_IDS.has(opts.siteId.toLowerCase())) {
+    warn(`inferred site id "${opts.siteId}" is generic — pass --id to avoid storage collisions on shared origins`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -110,50 +166,132 @@ function fatal(msg) {
   process.exit(1);
 }
 
-function promptPassphrase() {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+function warn(msg) {
+  console.error(`veil: warning: ${msg}`);
+}
 
-    // Disable echo for passphrase input
-    if (process.stdin.isTTY) {
-      process.stdout.write('Passphrase: ');
-      process.stdin.setRawMode(true);
-      let input = '';
-      process.stdin.resume();
-      process.stdin.setEncoding('utf8');
-      const onData = (ch) => {
-        if (ch === '\n' || ch === '\r' || ch === '\u0004') {
+// Raw-mode control keys, by code point: comparing against escape literals is
+// the same thing, but these read as the keys they are.
+const KEY_ETX = 3; // Ctrl-C
+const KEY_EOT = 4; // Ctrl-D
+const KEY_BACKSPACE = 8;
+const KEY_DEL = 127;
+
+/**
+ * Read one line from a TTY without echoing it.
+ *
+ * Raw mode hands over whatever the terminal has buffered, so one data event is
+ * not one keystroke: a pasted passphrase arrives as "secret\n" in a single
+ * chunk, and comparing the whole chunk to '\n' would bury the newline inside
+ * the passphrase. Every chunk is walked per code point, which also keeps
+ * backspace from cutting an astral character (emoji, some CJK) in half.
+ */
+function readHidden(promptText) {
+  return new Promise((resolve) => {
+    process.stdout.write(promptText);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+
+    let input = '';
+    // Escape-sequence state, kept across chunks: an arrow key arrives as
+    // ESC [ D — dropping only the ESC byte would append the printable
+    // "[D" to the passphrase. 'esc' has seen ESC, 'csi' is inside ESC [ ...
+    // (ends at a final byte 0x40-0x7E), 'ss3' is ESC O awaiting one byte.
+    let escState = null;
+    const finish = () => {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdin.removeListener('data', onData);
+      process.stdout.write('\n');
+      resolve(input);
+    };
+    const onData = (chunk) => {
+      for (const ch of Array.from(chunk)) {
+        const code = ch.codePointAt(0);
+        // Abort and line terminators come first — an incomplete escape
+        // sequence must never trap Ctrl-C or swallow Enter.
+        if (code === KEY_ETX) {
+          // Ctrl-C: hand the terminal back before dying, or the shell that
+          // follows inherits a raw, echo-less tty.
           process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stdin.removeListener('data', onData);
-          rl.close();
-          process.stdout.write('\n');
-          resolve(input);
-        } else if (ch === '\u0003') {
-          // Ctrl-C
           process.stdout.write('\n');
           process.exit(1);
-        } else if (ch === '\u007f' || ch === '\b') {
-          // Backspace
-          input = input.slice(0, -1);
-        } else {
-          input += ch;
         }
-      };
-      process.stdin.on('data', onData);
-    } else {
-      // Non-interactive: read from stdin pipe
-      rl.question('Passphrase: ', (answer) => {
-        rl.close();
-        resolve(answer || '');
-      });
-      // Handle closed stdin (e.g., </dev/null) — 'close' fires with no 'line'
-      rl.on('close', () => resolve(''));
-    }
+        if (ch === '\n' || ch === '\r' || code === KEY_EOT) {
+          // End of entry — anything after it in this chunk is not ours.
+          finish();
+          return;
+        }
+        if (escState === 'esc') {
+          if (ch === '[') { escState = 'csi'; continue; }
+          if (ch === 'O') { escState = 'ss3'; continue; }
+          escState = null; // lone ESC + one char: discard both
+          continue;
+        }
+        if (escState === 'csi') {
+          if (code >= 0x40 && code <= 0x7e) escState = null; // final byte
+          continue;
+        }
+        if (escState === 'ss3') {
+          escState = null;
+          continue;
+        }
+        if (code === 0x1b) {
+          escState = 'esc';
+          continue;
+        }
+        if (code === KEY_DEL || code === KEY_BACKSPACE) {
+          const chars = Array.from(input);
+          chars.pop();
+          input = chars.join('');
+          continue;
+        }
+        // Any remaining control character is not passphrase material.
+        if (code < 0x20) continue;
+        input += ch;
+      }
+    };
+    process.stdin.on('data', onData);
   });
+}
+
+/** Read one line from a pipe, printing nothing: scripts own that stdout. */
+function readPipedLine() {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin });
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      rl.close();
+      // rl.close() does not release the stream, and pause() still leaves
+      // the pipe handle holding the event loop: a caller that keeps its
+      // write end open would wait forever for this process to exit. The
+      // line is read and stdin is never touched again, so close it.
+      process.stdin.destroy();
+      resolve(value);
+    };
+    rl.once('line', done);
+    // Handle closed stdin (e.g., </dev/null) — 'close' fires with no 'line'
+    rl.once('close', () => done(''));
+  });
+}
+
+async function promptPassphrase() {
+  // A pipe feeds exactly one value; prompting into it would only pollute the
+  // caller's stdout.
+  if (!process.stdin.isTTY) {
+    return readPipedLine();
+  }
+  // A typo in a passphrase nobody can see locks the site out of its own
+  // content, so interactive entry is always confirmed.
+  const passphrase = await readHidden('Passphrase: ');
+  const confirmation = await readHidden('Confirm passphrase: ');
+  if (passphrase !== confirmation) {
+    fatal('passphrases do not match');
+  }
+  return passphrase;
 }
 
 function normalizeHtmlRoot(root) {
@@ -823,6 +961,7 @@ function collectLocalRefs(html, pageRelPath, inputRoot) {
 
 const FORMAT_VERSION = 2;
 const MIN_ITERATIONS = 100000;
+const DEFAULT_ITERATIONS = 600000;
 
 /**
  * Build the AAD that binds metadata to authenticated ciphertext.
@@ -1453,6 +1592,8 @@ function publishOutput(stagingDir, outputDir, force) {
 async function main() {
   const opts = parseArgs(process.argv);
 
+  emitStartupWarnings(opts);
+
   // -- Validate everything before touching the filesystem ------------------
 
   if (!fs.existsSync(opts.inputDir)) {
@@ -1483,18 +1624,24 @@ async function main() {
     fatal(`Iterations must be at least ${MIN_ITERATIONS} (got ${opts.iterations})`);
   }
 
-  if (opts.passphrase && opts.passphraseEnv) {
+  // null means the flag was never given; '' means it was given empty, which is
+  // a mistake rather than a request to prompt.
+  if (opts.passphrase !== null && opts.passphraseEnv) {
     fatal('Use only one of --passphrase or --passphrase-env');
   }
 
-  if (!opts.passphrase && opts.passphraseEnv) {
+  if (opts.passphrase === '') {
+    fatal('Passphrase cannot be empty');
+  }
+
+  if (opts.passphrase === null && opts.passphraseEnv) {
     opts.passphrase = process.env[opts.passphraseEnv] || '';
     if (!opts.passphrase) {
       fatal(`Environment variable ${opts.passphraseEnv} is empty or not set`);
     }
   }
 
-  if (!opts.passphrase) {
+  if (opts.passphrase === null) {
     opts.passphrase = await promptPassphrase();
     if (!opts.passphrase) {
       fatal('Passphrase cannot be empty');

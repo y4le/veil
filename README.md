@@ -70,6 +70,7 @@ Options:
   --html-root <dir>     Encrypt only HTML under this relative dir (repeatable)
   --no-inline           Skip local CSS/JS inlining
   --force               Replace a non-empty output directory
+  --version             Print the veil version
   --help                Show this help
 ```
 
@@ -82,7 +83,9 @@ inside the input tree are rejected rather than silently skipped or followed
 
 ### CI Usage
 
-In CI, always use `--passphrase-env` to read from a secret — never pass the passphrase as a CLI argument:
+In CI, always use `--passphrase-env` to read from a secret — never pass the
+passphrase as a CLI argument, where process listings and shell history can see
+it. Veil warns on stderr whenever `--passphrase` is used:
 
 ```bash
 node veil.js ./site ./_encrypted \

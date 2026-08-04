@@ -171,6 +171,7 @@ Options:
   --html-root <dir>     Encrypt only HTML under this relative dir (repeatable)
   --no-inline           Skip local CSS/JS inlining
   --force               Replace a non-empty output directory
+  --version             Print the veil version
   --help                Show this help
 ```
 

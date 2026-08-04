@@ -147,6 +147,133 @@ describe('CLI arguments', () => {
     assert.match(r.stderr, /cannot escape/);
     cleanup(dir);
   });
+
+  it('rejects an iteration count that is not a whole number', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'out'), '--passphrase', 'test', '--iterations', '100000junk']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /positive integer/);
+    cleanup(dir);
+  });
+
+  it('does not take a following option as an option value', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'out'), '--passphrase', 'test', '--iterations', '--remember']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /--iterations/);
+    cleanup(dir);
+  });
+
+  it('rejects extra positional arguments', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'out'), 'extra', '--passphrase', 'test']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /Unexpected argument: extra/);
+    cleanup(dir);
+  });
+
+  it('rejects an explicitly empty --passphrase instead of prompting', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'out'), '--passphrase', '', '--iterations', '100000']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /cannot be empty/);
+    cleanup(dir);
+  });
+
+  it('prints the version with --version', () => {
+    const r = run(['--version']);
+    assert.equal(r.code, 0);
+    assert.match(r.stdout.trim(), /^veil \d+\.\d+\.\d+$/);
+  });
+
+  it('warns that --passphrase is visible to other processes', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'out-warn-pass'), '--passphrase', 'test', '--iterations', '600000']);
+    assert.equal(r.code, 0);
+    assert.match(r.stderr, /warning: --passphrase is visible in process listings/);
+    cleanup(dir);
+  });
+
+  it('warns when the iteration count is below the default', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'out-warn-iter'), '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    assert.match(r.stderr, /warning: 100000 PBKDF2 iterations is below the default 600000/);
+    cleanup(dir);
+  });
+
+  it('warns when the site id inferred from the output directory is generic', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'dist'), '--passphrase', 'test', '--iterations', '100000']);
+    assert.equal(r.code, 0);
+    assert.match(r.stderr, /warning: inferred site id "dist" is generic/);
+    cleanup(dir);
+  });
+
+  it('does not warn about a generic output directory name when --id is given', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'dist'), '--passphrase', 'test', '--iterations', '100000', '--id', 'my-project']);
+    assert.equal(r.code, 0);
+    assert.doesNotMatch(r.stderr, /is generic/);
+    cleanup(dir);
+  });
+
+  it('reads a piped passphrase without printing a prompt', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>piped</body></html>' });
+    const outDir = path.join(dir, 'out-piped');
+    const r = run([siteDir, outDir, '--iterations', '100000'], { input: 'mypass\n' });
+    assert.equal(r.code, 0);
+    assert.doesNotMatch(r.stdout, /Passphrase:/);
+    const payload = extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8'));
+    assert.match(decryptPayload(payload, 'mypass'), /piped/);
+    cleanup(dir);
+  });
+
+  it('rejects an explicitly empty --id', () => {
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const r = run([siteDir, path.join(dir, 'out-empty-id'), '--passphrase', 'test', '--iterations', '100000', '--id', '']);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /--id must not be empty/);
+    cleanup(dir);
+  });
+
+  it('exits after the piped passphrase line even if the pipe stays open', async () => {
+    // rl.close() alone leaves stdin holding the event loop: a programmatic
+    // caller that satisfies the one-line protocol but keeps its write end
+    // open would wait forever for the child to exit.
+    const { spawn } = require('child_process');
+    const dir = tmpDir();
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>openpipe</body></html>' });
+    const outDir = path.join(dir, 'out-open-pipe');
+    const child = spawn(process.execPath, [VEIL, siteDir, outDir, '--iterations', '100000'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdin.write('open-pass\n'); // note: no end() — the pipe stays open
+    const code = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error('veil did not exit while the stdin pipe stayed open'));
+      }, 10000);
+      child.on('exit', (c) => {
+        clearTimeout(timer);
+        resolve(c);
+      });
+    });
+    assert.equal(code, 0);
+    const payload = extractPayload(fs.readFileSync(path.join(outDir, 'index.html'), 'utf8'));
+    assert.match(decryptPayload(payload, 'open-pass'), /openpipe/);
+    cleanup(dir);
+  });
 });
 
 // ---------------------------------------------------------------------------
