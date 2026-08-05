@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Decrypted — Veil demo zone</title>
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+<div class="page">
+
+<header class="masthead">
+  <div class="wordmark"><b>Veil</b> · demo zone</div>
+  <h1>You are reading a decrypted page.</h1>
+  <p class="lede">A moment ago this document was AES-256-GCM ciphertext. Your
+  browser stretched the passphrase you typed, unwrapped the site key, decrypted
+  the payload, and wrote the result into this tab; the server was never asked and
+  never saw it.</p>
+  <p class="scope-note">Everything on this page was inside the ciphertext,
+  including the title in your tab. Before you unlocked it, that title read
+  “Protected page.”</p>
+</header>
+
+<section>
+  <h2>State</h2>
+  <div class="body">
+    <dl class="kv">
+      <dt>route</dt><dd>/demo/</dd>
+      <dt>key scope</dt><dd>y4le-veil-demo</dd>
+      <dt>cached</dt><dd>the site master key, never the passphrase</dd>
+      <dt>storage</dt><dd>sessionStorage, unless you ticked “Remember this device”</dd>
+      <dt>cleared by</dt><dd>the <code>lock</code> control, top right; or closing the tab</dd>
+    </dl>
+    <p class="muted">The key is scoped to the build, not to this page, which is
+    what the next two links demonstrate.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Keep going</h2>
+  <div class="body">
+    <ul class="rows">
+      <li><b><a href="second.html">/demo/second.html</a></b>: same build, same
+      key scope; it opens with no second prompt.</li>
+      <li><b><a href="../vault/">/vault/</a></b>: a separate build with its own
+      passphrase and its own scope; it prompts, and the passphrase that opened
+      this page is rejected there.</li>
+      <li><b><a href="../">Back to the landing page</a></b>: never encrypted, so
+      it never prompts.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>Honesty</h2>
+  <div class="body">
+    <p>The plaintext of this page is committed to the public repository, so
+    nothing here is secret. What is being demonstrated is that the deployed
+    artifact really is ciphertext, and that the two zones really are
+    independent.</p>
+    <p>You can check both claims yourself: fetch this route with
+    <code>curl</code> and read what the host actually serves.</p>
+  </div>
+</section>
+
+<footer>
+  <a href="../">landing page</a>
+  <a href="https://github.com/y4le/veil">github.com/y4le/veil</a>
+</footer>
+
+</div>
+</body>
+</html>

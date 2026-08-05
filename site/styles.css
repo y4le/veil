@@ -1,0 +1,264 @@
+/* Yale Thomas design language: warm near-black, hairline structure, one
+   restrained red used as a mark. Dark only, so the page and the unlock screen
+   it links to read as one surface. */
+
+@font-face {
+  font-family: Geist;
+  src: url(fonts/Geist-Regular.woff2) format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: Geist;
+  src: url(fonts/Geist-Medium.woff2) format('woff2');
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url(fonts/GeistMono-Regular.woff2) format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+
+:root {
+  --bg: #0e0e0d;
+  --ink: #e8e3d5;
+  --muted: #8a857a;
+  --rule: #2a2926;
+  --rule-strong: #403e39;
+  --accent: #c1432e;
+  /* #c1432e is 3.8:1 on the background: enough for a rule, not for a sentence.
+     Text that has to be read uses the lighter tint. */
+  --accent-ink: #e2705c;
+  --sans: Geist, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  color-scheme: dark;
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  font-feature-settings: 'kern' 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 58rem;
+  margin: 0 auto;
+  padding: 3.5rem 1.5rem 5rem;
+}
+
+/* Masthead ---------------------------------------------------------------- */
+
+.masthead { padding-bottom: 1.4rem; border-bottom: 1px solid var(--rule-strong); }
+
+.wordmark {
+  font-family: var(--mono);
+  font-size: .78rem;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.wordmark b { color: var(--ink); font-weight: 400; }
+
+h1 {
+  margin-top: 1.6rem;
+  font-size: 1.85rem;
+  font-weight: 500;
+  letter-spacing: -.015em;
+  line-height: 1.25;
+  max-width: 30ch;
+  text-wrap: balance;
+}
+
+.lede {
+  margin-top: .9rem;
+  max-width: 60ch;
+  color: var(--ink);
+}
+
+.scope-note {
+  margin-top: 1.1rem;
+  padding-left: .9rem;
+  border-left: 2px solid var(--accent);
+  max-width: 60ch;
+  color: var(--muted);
+  font-size: .92rem;
+}
+
+/* Sections ---------------------------------------------------------------- */
+
+section {
+  display: grid;
+  grid-template-columns: 9.5rem 1fr;
+  gap: 0 2rem;
+  padding: 2.2rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+section:last-of-type { border-bottom: none; }
+
+section > h2 {
+  font-family: var(--mono);
+  font-size: .74rem;
+  font-weight: 400;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding-top: .25rem;
+}
+
+/* min-width:0 so a wide table or code block scrolls inside .scroll-x/pre
+   instead of stretching the grid column and the page with it. */
+.body { max-width: 62ch; min-width: 0; }
+.body > * + * { margin-top: .85rem; }
+
+p { max-width: 62ch; }
+
+.muted { color: var(--muted); }
+
+a {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent);
+  padding-bottom: 1px;
+  transition: border-color .12s, color .12s;
+}
+a:hover { color: var(--accent-ink); }
+a:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; border-radius: 1px; }
+
+code, kbd { font-family: var(--mono); font-size: .88em; }
+
+/* Lists: hairline rows rather than bullets --------------------------------- */
+
+ul.rows { list-style: none; }
+ul.rows > li {
+  padding: .55rem 0;
+  border-top: 1px solid var(--rule);
+  max-width: 66ch;
+}
+ul.rows > li:first-child { border-top: none; padding-top: 0; }
+ul.rows > li > b { font-weight: 500; }
+
+ol.steps { list-style: none; counter-reset: step; }
+ol.steps > li {
+  position: relative;
+  padding: .5rem 0 .5rem 2.1rem;
+  border-top: 1px solid var(--rule);
+  max-width: 66ch;
+  counter-increment: step;
+}
+ol.steps > li:first-child { border-top: none; }
+ol.steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: .5rem;
+  font-family: var(--mono);
+  font-size: .78rem;
+  color: var(--accent-ink);
+}
+
+/* Tables ------------------------------------------------------------------ */
+
+/* Below its min-width the table scrolls inside .scroll-x rather than wrapping
+   every cell into an unreadable column. */
+.table { width: 100%; min-width: 30rem; border-collapse: collapse; font-size: .88rem; }
+.table th, .table td {
+  text-align: left;
+  padding: .5rem .9rem .5rem 0;
+  border-top: 1px solid var(--rule);
+  vertical-align: top;
+}
+.table thead th {
+  border-top: none;
+  border-bottom: 1px solid var(--rule-strong);
+  font-family: var(--mono);
+  font-size: .72rem;
+  font-weight: 400;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding-bottom: .45rem;
+}
+.table td.m, .table th.m { font-family: var(--mono); font-size: .82rem; }
+.table td.locked { color: var(--muted); }
+.scroll-x { overflow-x: auto; }
+
+/* Key/value metadata ------------------------------------------------------ */
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: .3rem 1.4rem;
+  font-family: var(--mono);
+  font-size: .82rem;
+}
+.kv dt { color: var(--muted); }
+.kv dd { overflow-wrap: anywhere; }
+
+/* Code -------------------------------------------------------------------- */
+
+pre {
+  font-family: var(--mono);
+  font-size: .8rem;
+  line-height: 1.7;
+  color: var(--ink);
+  padding: .9rem 1rem;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  overflow-x: auto;
+}
+pre .c { color: var(--muted); }
+
+/* The disclosed passphrase, presented as evidence rather than decoration --- */
+
+.passphrase {
+  display: flex;
+  align-items: baseline;
+  gap: .9rem;
+  flex-wrap: wrap;
+  padding: .7rem .9rem;
+  border: 1px solid var(--rule-strong);
+  border-left: 2px solid var(--accent);
+  border-radius: 2px;
+  font-family: var(--mono);
+  font-size: .85rem;
+}
+.passphrase .label {
+  font-size: .72rem;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.passphrase .value { font-size: 1.05rem; user-select: all; }
+
+/* Footer ------------------------------------------------------------------ */
+
+footer {
+  margin-top: 2.6rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--rule-strong);
+  font-family: var(--mono);
+  font-size: .76rem;
+  color: var(--muted);
+  display: flex;
+  gap: 1.6rem;
+  flex-wrap: wrap;
+}
+
+/* Narrow ------------------------------------------------------------------ */
+
+@media (max-width: 46rem) {
+  .page { padding: 2.5rem 1.1rem 3.5rem; }
+  h1 { font-size: 1.5rem; }
+  section { grid-template-columns: 1fr; gap: .9rem; padding: 1.8rem 0; }
+  section > h2 { padding-top: 0; }
+}

@@ -4,6 +4,10 @@ Encrypt static HTML sites at build time. Veil wraps each HTML file in a
 self-contained shell that prompts for a passphrase and decrypts client-side
 using Web Crypto. No server, no dependencies, one file.
 
+**Live demo:** [y4le.github.io/veil](https://y4le.github.io/veil/) — a public
+landing page linking to two encrypted zones, one with the passphrase printed on
+it. Source in [`site/`](site/), built by [`build-site.sh`](build-site.sh).
+
 **Good for:** client previews, trip plans, proposal decks, private-ish docs,
 prototypes on static hosting.
 

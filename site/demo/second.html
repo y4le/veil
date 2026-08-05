@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Second page — Veil demo zone</title>
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+<div class="page">
+
+<header class="masthead">
+  <div class="wordmark"><b>Veil</b> · demo zone</div>
+  <h1>No second prompt.</h1>
+  <p class="lede">This page is encrypted exactly like the one you came from. It
+  opened anyway, because the key cached when you unlocked that page belongs to
+  the whole build; unlocking one page unlocks every page in the same zone.</p>
+</header>
+
+<section>
+  <h2>Why</h2>
+  <div class="body">
+    <p>Each build mints one master key. Every page in it is encrypted under that
+    key with its own IV, and the browser caches the key under a name derived from
+    the zone's id. This page found <code>veil:v2:y4le-veil-demo:mk</code> already
+    populated and used it.</p>
+    <p>That is also why <a href="../vault/">/vault/</a> still prompts: it was
+    built separately, under its own id and passphrase, so nothing in this zone's
+    cache can open it.</p>
+    <p class="muted">Redeploying the site mints a new master key, so this cached
+    one stops working and you are asked again.</p>
+  </div>
+</section>
+
+<footer>
+  <a href="./">demo index</a>
+  <a href="../">landing page</a>
+  <a href="https://github.com/y4le/veil">github.com/y4le/veil</a>
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vault — Veil</title>
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+<div class="page">
+
+<header class="masthead">
+  <div class="wordmark"><b>Veil</b> · vault zone</div>
+  <h1>You had the other passphrase.</h1>
+  <p class="lede">The two zones share no master key and no storage key. This one
+  was built by a separate Veil run, under its own id, with a passphrase that is
+  published nowhere; the demo passphrase is rejected here, and the key that
+  unlocking the demo zone leaves in your browser cannot open it either.</p>
+</header>
+
+<section>
+  <h2>State</h2>
+  <div class="body">
+    <dl class="kv">
+      <dt>route</dt><dd>/vault/</dd>
+      <dt>key scope</dt><dd>y4le-veil-vault</dd>
+      <dt>built by</dt><dd>the second of two chained runs, from a repository secret</dd>
+      <dt>shares with /demo/</dt><dd>the origin and the public assets; no key, no unlock state</dd>
+    </dl>
+  </div>
+</section>
+
+<section>
+  <h2>What that proves, and what it does not</h2>
+  <div class="body">
+    <p>It proves the wall is real: the bytes on the wire for this route are
+    ciphertext, and only the right passphrase turns them into this document.</p>
+    <p>It does not prove the content is secret. This page's plaintext is
+    committed to the public repository, which is the point; you can compare the
+    source against what the host serves and confirm that Veil did what it
+    claims.</p>
+    <p class="muted">Veil protects a built artifact. A public source repository,
+    an untrusted build pipeline, and a host that can rewrite the unlock shell are
+    all outside what it can do.</p>
+  </div>
+</section>
+
+<footer>
+  <a href="../">landing page</a>
+  <a href="https://github.com/y4le/veil/blob/main/docs/threat-model.md">threat model</a>
+</footer>
+
+</div>
+</body>
+</html>

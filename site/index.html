@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Veil — build-time encryption for static HTML</title>
+<meta name="description" content="Veil encrypts static HTML at build time. Pages decrypt in the browser with Web Crypto; no server, no dependencies, one file.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page">
+
+<header class="masthead">
+  <div class="wordmark"><b>Veil</b></div>
+  <h1>Build-time encryption for static HTML.</h1>
+  <p class="lede">Veil turns selected HTML into authenticated ciphertext and a
+  self-contained unlock page; deploy it to any HTTPS static host, with no
+  application server.</p>
+  <p class="scope-note">Deterrence for previews and private-ish documents; not
+  identity-based access control, and not for regulated or high-impact data.</p>
+</header>
+
+<section>
+  <h2>Try it</h2>
+  <div class="body">
+    <p>This site is one deployment with two protected zones. One passphrase is
+    printed below; the other is not.</p>
+
+    <div class="scroll-x">
+      <table class="table">
+        <thead>
+          <tr><th>Route</th><th>Key scope</th><th>Passphrase</th><th>Expected</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="m"><a href="demo/">/demo/</a></td>
+            <td class="m">y4le-veil-demo</td>
+            <td>shown below</td>
+            <td>decrypts</td>
+          </tr>
+          <tr>
+            <td class="m">/demo/second.html</td>
+            <td class="m">y4le-veil-demo</td>
+            <td>already unlocked</td>
+            <td>opens without a prompt</td>
+          </tr>
+          <tr>
+            <td class="m"><a href="vault/">/vault/</a></td>
+            <td class="m">y4le-veil-vault</td>
+            <td class="locked">withheld</td>
+            <td class="locked">stays locked</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="passphrase">
+      <span class="label">/demo/ passphrase</span>
+      <span class="value">open-sesame</span>
+    </div>
+
+    <p class="muted">Walk it in one tab, leaving “Remember this device”
+    unchecked:</p>
+
+    <ol class="steps">
+      <li>Open <a href="demo/">/demo/</a> and enter the passphrase; the page
+      decrypts in your browser, not on the server.</li>
+      <li>Follow its link to <code>/demo/second.html</code>; it opens with no
+      prompt, because both pages came from one build and share one key scope.</li>
+      <li>Follow its link to <a href="vault/">/vault/</a>; it prompts again, and
+      the demo passphrase is rejected. Separate build, separate passphrase,
+      separate scope.</li>
+      <li>Go back to <a href="demo/">/demo/</a>; it opens straight away from the
+      key cached for this session. Close the tab and it locks again.</li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>What it does</h2>
+  <div class="body">
+    <ul class="rows">
+      <li><b>The deployed artifact holds no protected plaintext.</b> Each
+      protected page ships as AES-256-GCM ciphertext plus a small unlock shell;
+      local CSS and JS that Veil can inline go inside the ciphertext with it.</li>
+      <li><b>Pages decrypt in the browser.</b> Web Crypto stretches the
+      passphrase and unwraps the site key; the host serves static files and runs
+      nothing.</li>
+      <li><b>Edited ciphertext fails to decrypt.</b> AES-GCM authenticates every
+      page, so tampering breaks it rather than rendering something else;
+      swapping in a whole page, or an older build, is a different attack and is
+      out of scope.</li>
+      <li><b>Subtrees can be protected separately.</b> Each zone gets its own
+      passphrase and its own browser-storage scope; this site is one such
+      deployment.</li>
+      <li><b>The passphrase is never stored.</b> Veil caches the site's master
+      key for the tab, or for the device if the visitor asks; every rebuild mints
+      a new key and invalidates the old one.</li>
+      <li><b>Builds are auditable before they ship.</b> <code>veil verify</code>
+      checks wrapper integrity, that the pages you meant to protect are
+      protected, that the output corresponds to its input, and that everything
+      decrypts.</li>
+      <li><b>One file, no runtime dependencies.</b> <code>veil.js</code> is a
+      single Node script; vendor it, pin the commit, record the digest.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>Boundary</h2>
+  <div class="body">
+    <p>Veil is deterrence, not absolute security. It keeps selected HTML out of a
+    plaintext deploy artifact and out of search indexes; it does not do the
+    following.</p>
+    <ul class="rows">
+      <li><b>The ciphertext is public, so guessing is offline and unlimited.</b>
+      PBKDF2 at 600,000 iterations raises the cost per guess; a weak passphrase
+      still loses.</li>
+      <li><b>Only HTML is encrypted.</b> Images, fonts, and data files stay
+      public, and so do page count, file sizes, and directory structure.</li>
+      <li><b>A compromised host wins.</b> Whoever serves the page can replace the
+      unlock shell and capture the passphrase as it is typed.</li>
+      <li><b>Any JavaScript on the same origin wins.</b> It can read every
+      cached key out of browser storage, so every zone the visitor has unlocked
+      is readable by it; separate zones limit that blast radius, they do not
+      stop it. Keep analytics, chat widgets, and tag managers off the origin
+      entirely.</li>
+      <li><b>There are no accounts and no revocation.</b> Anyone with the
+      passphrase can read the content and keep it; rotating the passphrase cannot
+      retract what was already downloaded.</li>
+      <li><b>Whatever builds the site sees everything.</b> The machine or CI
+      runner that runs Veil holds the plaintext and the passphrase, and can
+      replace the artifact before it is published; <code>veil verify</code>
+      running in that same job cannot prove otherwise.</li>
+      <li><b>Veil protects the artifact, not the source.</b> Both pages behind
+      the doors on this site are plaintext in the public repository; what is
+      demonstrated here is the wall, not the secret.</li>
+    </ul>
+    <p>The full <a href="https://github.com/y4le/veil/blob/main/docs/threat-model.md">threat
+    model</a> states the boundary in detail.</p>
+  </div>
+</section>
+
+<section>
+  <h2>How a build works</h2>
+  <div class="body">
+    <ol class="steps">
+      <li>Inline each page's local CSS and JS, so a protected page still styles
+      and scripts itself under a strict content security policy.</li>
+      <li>Mint one random 256-bit master key per build, and wrap it under a key
+      derived from the passphrase with PBKDF2-SHA256.</li>
+      <li>Encrypt every page with the master key under AES-256-GCM, each with its
+      own IV and its own authenticated path binding.</li>
+      <li>Replace the page with a wrapper: the payload, an unlock form, and a
+      <code>noindex</code> robots meta. The real title exists only inside the
+      ciphertext.</li>
+    </ol>
+    <p><a href="https://github.com/y4le/veil/blob/main/docs/how-it-works.md">How
+    it works</a> covers inlining, asset omission, and unlock state.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Quick start</h2>
+  <div class="body">
+<pre><span class="c"># typed, not left in shell history</span>
+read -rs VEIL_PASSPHRASE &amp;&amp; export VEIL_PASSPHRASE
+
+<span class="c"># encrypt a site into a fresh output directory</span>
+node veil.js ./my-site ./encrypted \
+  --passphrase-env VEIL_PASSPHRASE --id my-project
+
+<span class="c"># audit what you are about to publish</span>
+node veil.js verify ./encrypted --input ./my-site \
+  --id my-project --passphrase-env VEIL_PASSPHRASE</pre>
+    <p>Node.js 18+ and a host that serves over HTTPS; Web Crypto exists only in
+    secure contexts, so a protected page needs HTTPS, <code>localhost</code>, or
+    <code>file:</code>.</p>
+  </div>
+</section>
+
+<section>
+  <h2>This site</h2>
+  <div class="body">
+    <p>Built by two chained Veil runs over one source tree, then verified once
+    per zone before publishing.</p>
+    <dl class="kv">
+      <dt>public</dt><dd>/, /styles.css, /favicon.svg, /fonts/</dd>
+      <dt>zone 1</dt><dd>/demo/ · scope y4le-veil-demo · passphrase disclosed</dd>
+      <dt>zone 2</dt><dd>/vault/ · scope y4le-veil-vault · passphrase withheld</dd>
+      <dt>build</dt><dd><a href="https://github.com/y4le/veil/blob/main/build-site.sh">build-site.sh</a>,
+      run by <a href="https://github.com/y4le/veil/blob/main/.github/workflows/pages.yml">pages.yml</a></dd>
+    </dl>
+    <p>This page is not encrypted; read its source and you will find it. Read the
+    source of either protected route and you will find a payload.</p>
+    <p class="muted">It is also deployed on <code>github.io</code>, one origin
+    shared with every other project site on the account; that is the situation
+    the boundary above warns about, and it is acceptable here only because
+    nothing on this site is secret. A deployment that matters gets its own
+    hostname.</p>
+  </div>
+</section>
+
+<footer>
+  <a href="https://github.com/y4le/veil">github.com/y4le/veil</a>
+  <a href="https://github.com/y4le/veil/blob/main/README.md">docs</a>
+  <a href="https://github.com/y4le/veil/blob/main/docs/threat-model.md">threat model</a>
+</footer>
+
+</div>
+</body>
+</html>
