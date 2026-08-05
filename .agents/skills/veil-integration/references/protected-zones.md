@@ -139,7 +139,7 @@ them as verification. Confirm the identity of every public file below.
     VEIL_PASSPHRASE_A: ${{ secrets.VEIL_PASSPHRASE_A }}
     VEIL_PASSPHRASE_B: ${{ secrets.VEIL_PASSPHRASE_B }}
 
-- uses: actions/upload-pages-artifact@v4
+- uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
   with:
     path: ./_encrypted
 ```

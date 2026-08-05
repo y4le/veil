@@ -45,6 +45,13 @@ a CLI-supplied passphrase is visible in process listings and shell history.
 
 ## Workflow
 
+Every action is pinned to a full commit SHA, with the release tag in a comment.
+A `@vN` tag is movable, and `checkout` and `setup-node` run *before* the step
+that receives the passphrase; either could rewrite the workspace or the PATH and
+capture it. Pinning `veil.js` and leaving the rest of the job movable protects
+nothing. Refresh the SHAs the same way you refresh Veil's: read the diff, then
+bump.
+
 ```yaml
 name: Deploy encrypted site
 
@@ -68,10 +75,10 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20'
+          node-version: '24'
 
       # Vendored from raw.githubusercontent.com/y4le/veil/<COMMIT-SHA>/veil.js
       - name: Verify vendored Veil
@@ -98,12 +105,12 @@ jobs:
         env:
           VEIL_PASSPHRASE: ${{ secrets.VEIL_PASSPHRASE }}
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: ./_encrypted
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
 ```
 
 ## With a build step
