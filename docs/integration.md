@@ -49,6 +49,12 @@ shasum -a 256 -c ./tools/veil.js.sha256
 Bump the SHA, re-download, re-record the digest, and read the diff. Same bar as
 any other dependency with access to secrets.
 
+Then rebuild, before you verify. When the wrapper template changes between
+versions, `veil verify` reports every page of an artifact built by the old
+version as `wrapper_modified`, because it compares against the wrapper the
+running file generates. Rebuilding and re-verifying is the fix; auditing an old
+artifact with a new `veil.js` is not a meaningful check.
+
 ## Wire the build
 
 ```bash

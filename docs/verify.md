@@ -52,6 +52,11 @@ Note what this does not prove: a canonical wrapper regenerated around rewritten
 payload data still matches. Only the decryption stage authenticates the
 ciphertext and key metadata themselves.
 
+That comparison is against the wrapper *this* `veil.js` generates, so audit an
+artifact with the file that built it. A build made by an older version whose
+wrapper template has since changed reports `wrapper_modified` on every page;
+rebuild with the new version rather than reading it as tampering.
+
 **`--input`.** Stale files left in the output, input files that never made it
 there, and passthrough files that no longer match their source. A missing
 *non-HTML* file is only a warning; an inlined asset that nothing public can reach
