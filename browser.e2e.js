@@ -212,6 +212,77 @@ describe('wrapper runtime (browser)', () => {
     await page.waitForSelector('#marker-a');
     await page.goto(`${baseUrl}/a/about.html`);
     await page.waitForSelector('#marker-b');
+    // A cached key decrypts fast enough to finish while the wrapper is still
+    // parsing. The decrypted document has to replace the wrapper even then,
+    // rather than being appended to it.
+    assert.equal(await page.title(), 'About', 'the real title must replace "Protected page"');
+    const leftovers = await page.evaluate(() => ({
+      prompt: document.querySelectorAll('#veil-prompt').length,
+      payload: document.querySelectorAll('#veil-payload').length,
+    }));
+    assert.deepEqual(leftovers, { prompt: 0, payload: 0 }, 'no wrapper markup may survive the write');
+    await context.close();
+  });
+
+  it('the lock control is labelled, legible against the decrypted page, and keyboard-operable', async () => {
+    const { context, page } = await newPage();
+    await page.goto(`${baseUrl}/a/index.html`);
+    await submitPass(page, PASS, { remember: true });
+    await page.waitForSelector('#marker-a');
+
+    const lock = await page.evaluate(() => {
+      const el = document.querySelector('.veil-lock');
+      if (!el) return null;
+      const s = getComputedStyle(el);
+      return {
+        text: el.textContent,
+        label: el.getAttribute('aria-label'),
+        title: el.getAttribute('title'),
+        // It sits over a document whose styles the wrapper does not control, so
+        // it has to carry its own background rather than inherit one.
+        background: s.backgroundColor,
+        color: s.color,
+        borderColor: s.borderTopColor,
+        fontFamily: s.fontFamily,
+      };
+    });
+    assert.ok(lock, 'the decrypted page must carry a lock control');
+    assert.equal(lock.text, 'lock', 'the control is labelled in text, not with an emoji');
+    assert.ok(/clear the cached key/i.test(lock.label || ''), 'it needs an accessible name saying what it does');
+    assert.equal(lock.title, lock.label, 'the tooltip and the accessible name must agree');
+    assert.equal(lock.background, 'rgb(14, 14, 13)');
+    assert.equal(lock.color, 'rgb(232, 227, 213)');
+    assert.equal(lock.borderColor, 'rgb(111, 107, 97)');
+    assert.match(lock.fontFamily, /mono/i);
+
+    // Reachable and activatable from the keyboard alone. Tab rather than
+    // .focus(), because only real keyboard entry matches :focus-visible.
+    for (let i = 0; i < 6; i++) {
+      await page.keyboard.press('Tab');
+      if (await page.evaluate(() => document.activeElement.classList.contains('veil-lock'))) break;
+    }
+    const focus = await page.evaluate(() => {
+      const el = document.querySelector('.veil-lock');
+      if (el !== document.activeElement) return null;
+      const s = getComputedStyle(el);
+      return { visible: el.matches(':focus-visible'), outline: s.outlineColor + ' ' + s.outlineWidth, shadow: s.boxShadow };
+    });
+    assert.ok(focus, 'the lock control must be reachable by Tab');
+    assert.ok(focus.visible, 'keyboard focus must match :focus-visible');
+    assert.equal(focus.outline, 'rgb(193, 67, 46) 2px', 'the inner ring is the accent');
+    // The outer ring is the control's own dark, and it has to have real width:
+    // the pair is what keeps one contrasting edge over any decrypted-page
+    // background, including one painted in the accent itself.
+    assert.equal(focus.shadow, 'rgb(14, 14, 13) 0px 0px 0px 4px', 'a 4px outer ring, not inset');
+
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('#veil-prompt:not(.veil-hidden)');
+    const r = await page.evaluate((k) => ({
+      session: sessionStorage.getItem(k),
+      local: localStorage.getItem(k),
+    }), SK);
+    assert.equal(r.session, null, 'locking must clear the session key');
+    assert.equal(r.local, null, 'locking must clear the remembered key');
     await context.close();
   });
 

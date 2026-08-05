@@ -1222,20 +1222,25 @@ function generateWrapper(pageData) {
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>Protected page</title>
 <style>
+/* Accent #c1432e is used as a mark: rules, focus, and active state. Error text
+   uses the lighter #e2705c because #c1432e on #0e0e0d is 3.8:1, which carries a
+   border but not a sentence the visitor has to read. Control boundaries use
+   #6f6b61 (3.6:1) rather than the quieter #2a2926/#403e39 separator rules,
+   which sit below the 3:1 an active control needs to be findable. */
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.veil-prompt{max-width:360px;width:100%;padding:2rem;text-align:center}
-.veil-prompt h1{font-size:1.25rem;font-weight:500;margin-bottom:1.5rem;color:#a0a0c0}
-.veil-prompt input[type=password]{width:100%;padding:.75rem 1rem;font-size:1rem;background:#16213e;border:1px solid #333;border-radius:6px;color:#e0e0e0;outline:none;transition:border-color .2s}
-.veil-prompt input[type=password]:focus{border-color:#7c83ff}
-.veil-prompt .veil-remember{display:flex;align-items:center;gap:.5rem;margin-top:.75rem;font-size:.85rem;color:#888;cursor:pointer;justify-content:center}
-.veil-prompt .veil-remember input{cursor:pointer}
-.veil-prompt .veil-btn{width:100%;padding:.75rem;margin-top:1rem;font-size:1rem;background:#7c83ff;color:#fff;border:none;border-radius:6px;cursor:pointer;transition:background .2s}
-.veil-prompt .veil-btn:hover{background:#6a70e0}
-.veil-prompt .veil-btn:disabled{background:#444;cursor:not-allowed}
-.veil-error{color:#ff6b6b;font-size:.85rem;margin-top:.75rem;min-height:1.2em}
-.veil-lock{position:fixed;top:12px;right:12px;background:none;border:none;color:#666;font-size:1.25rem;cursor:pointer;padding:4px 8px;z-index:99999;opacity:.5;transition:opacity .2s}
-.veil-lock:hover{opacity:1}
+body{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0e0e0d;color:#e8e3d5;color-scheme:dark;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1.5rem;line-height:1.5}
+.veil-prompt{max-width:23rem;width:100%}
+.veil-prompt h1{font-size:1rem;font-weight:400;letter-spacing:.01em;padding-bottom:.9rem;border-bottom:1px solid #2a2926}
+.veil-prompt input[type=password]{width:100%;margin-top:1.4rem;padding:.4rem 0;font-family:inherit;font-size:.95rem;background:none;border:none;border-bottom:1px solid #6f6b61;border-radius:0;color:#e8e3d5;outline:none;transition:border-color .12s}
+.veil-prompt input[type=password]::placeholder{color:#8a857a}
+.veil-prompt input[type=password]:focus{border-bottom-color:#c1432e}
+.veil-prompt .veil-remember{display:flex;align-items:center;gap:.5rem;margin-top:1rem;font-size:.8rem;color:#8a857a;cursor:pointer;width:fit-content}
+.veil-prompt .veil-remember input{cursor:pointer;accent-color:#c1432e}
+.veil-prompt .veil-btn{margin-top:1.4rem;padding:.45rem 1.4rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.78rem;letter-spacing:.1em;text-transform:uppercase;background:none;color:#e8e3d5;border:1px solid #6f6b61;border-radius:2px;cursor:pointer;transition:border-color .12s}
+.veil-prompt .veil-btn:hover{border-color:#c1432e}
+.veil-prompt .veil-btn:disabled{color:#8a857a;border-color:#2a2926;cursor:not-allowed}
+.veil-prompt :focus-visible{outline:1px solid #c1432e;outline-offset:3px}
+.veil-error{color:#e2705c;font-size:.8rem;margin-top:.9rem;min-height:1.2em}
 .veil-hidden{display:none!important}
 </style>
 </head>
@@ -1299,14 +1304,32 @@ return S.decrypt({name:'AES-GCM',iv:toAb(iv),additionalData:toAb(aad),tagLength:
 
 function showPage(buf){
 var html=new TextDecoder().decode(buf);
+// A cached key can decrypt before the wrapper has finished parsing. While the
+// parser is still active the insertion point is defined, so document.write
+// appends at that point instead of replacing the document: the prompt markup
+// and the payload survive, and the decrypted <title> lands in the body where
+// it does nothing. Wait for the parser to finish before writing.
+if(D.readyState==='loading'){
+D.addEventListener('DOMContentLoaded',function(){writeDoc(html)});
+return;
+}
+writeDoc(html);
+}
+
+function writeDoc(html){
 D.open();D.write(html);D.close();
 // Add lock button to decrypted page
 var lock=D.createElement('button');
-lock.className='veil-lock';lock.textContent='\\u{1F512}';
-lock.title='Lock (forget passphrase)';
+lock.className='veil-lock';lock.textContent='lock';
+// The decrypted document supplies its own styles, so this control carries a
+// solid background of its own rather than inheriting unknown contrast, and its
+// focus ring is two-tone: whatever colour the page puts behind it, one of the
+// two rings still has an edge that contrasts.
+lock.title='Lock; clear the cached key';
+lock.setAttribute('aria-label','Lock; clear the cached key');
 lock.onclick=function(){doLogout()};
 var s=D.createElement('style');
-s.textContent='.veil-lock{position:fixed;top:12px;right:12px;background:none;border:none;color:#666;font-size:1.25rem;cursor:pointer;padding:4px 8px;z-index:99999;opacity:.5;transition:opacity .2s}.veil-lock:hover{opacity:1}';
+s.textContent='.veil-lock{position:fixed;top:10px;right:10px;padding:3px 8px;background:#0e0e0d;color:#e8e3d5;border:1px solid #6f6b61;border-radius:2px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.4;letter-spacing:.08em;cursor:pointer;z-index:99999;transition:border-color .12s}.veil-lock:hover{border-color:#c1432e}.veil-lock:focus-visible{outline:2px solid #c1432e;outline-offset:0;box-shadow:0 0 0 4px #0e0e0d}';
 var host=D.body||D.documentElement;
 host.appendChild(s);host.appendChild(lock);
 }

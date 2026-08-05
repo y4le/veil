@@ -93,8 +93,8 @@ The cached value is the master key, never the passphrase. It is stored under
   this device"; `--remember` makes that box checked by default.
 
 Because the key is site-scoped rather than page-scoped, unlocking one page
-unlocks every page in the same build. The 🔒 button and `?veil=logout` clear
-both tiers.
+unlocks every page in the same build. The `lock` button in the corner of a
+decrypted page, and `?veil=logout`, clear both tiers.
 
 ## Site ids
 

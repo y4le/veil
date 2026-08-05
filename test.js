@@ -1499,6 +1499,21 @@ describe('wrapper HTML', () => {
     assert.match(wrapper, /veil-form/);
   });
 
+  it('styles the lock control only where that style survives, and only once', () => {
+    const siteDir = setupSite(dir, { 'index.html': '<html><body>x</body></html>' });
+    const outDir = path.join(dir, 'out-lock-style');
+    run([siteDir, outDir, '--passphrase', 'test', '--iterations', '100000']);
+    const wrapper = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
+    // showPage() replaces the document before the lock button exists, so a
+    // .veil-lock rule in the wrapper's own stylesheet is dead weight on every
+    // page. The only copy belongs in the stylesheet injected after the write.
+    const rules = wrapper.match(/\.veil-lock\{/g) || [];
+    assert.equal(rules.length, 1, 'exactly one .veil-lock rule block, the injected one');
+    const styleBlock = wrapper.slice(wrapper.indexOf('<style>'), wrapper.indexOf('</style>'));
+    assert.ok(!styleBlock.includes('veil-lock'), 'the wrapper stylesheet must not carry it');
+    assert.match(wrapper, /aria-label','Lock; clear the cached key'/);
+  });
+
   it('does not leak the source page title into the wrapper', () => {
     const siteDir = setupSite(dir, { 'index.html': '<html><head><title>Acme acquisition proposal</title></head><body>x</body></html>' });
     const outDir = path.join(dir, 'out-title');

@@ -64,7 +64,7 @@ Check that:
 - the correct passphrase unlocks it and the real title comes back
 - a wrong passphrase shows an error and stays locked
 - a second protected page opens without prompting again
-- the 🔒 button locks the site again
+- the `lock` button in the corner locks the site again
 - images and styles render after unlock
 
 Then read [how it works](how-it-works.md) and the
