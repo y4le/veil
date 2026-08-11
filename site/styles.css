@@ -242,28 +242,6 @@ pre {
 }
 pre .c { color: var(--muted); }
 
-/* The disclosed passphrase, presented as evidence rather than decoration --- */
-
-.passphrase {
-  display: flex;
-  align-items: baseline;
-  gap: .9rem;
-  flex-wrap: wrap;
-  padding: .7rem .9rem;
-  border: 1px solid var(--rule-strong);
-  border-left: 2px solid var(--accent);
-  border-radius: 2px;
-  font-family: var(--mono);
-  font-size: .85rem;
-}
-.passphrase .label {
-  font-size: .72rem;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-.passphrase .value { font-size: 1.05rem; user-select: all; }
-
 /* Footer ------------------------------------------------------------------ */
 
 footer {
