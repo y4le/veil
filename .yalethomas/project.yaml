@@ -1,0 +1,18 @@
+schema: 1
+title: Veil
+description: Encrypt static HTML at build time and unlock it in the browser without a server.
+bullets:
+  - Seals protected pages with AES-256-GCM and ships no protected plaintext in the deploy artifact.
+  - Shares scoped unlock state across multi-page sites without storing the passphrase.
+  - Audits wrapper integrity, input correspondence, and decryption before deployment.
+date:
+  start: "2026-03"
+  end: "present"
+link: https://yalethom.as/veil/
+type: tool
+tags:
+  - static sites
+  - encryption
+  - Web Crypto
+  - Node.js
+svg: .yalethomas/card.svg

@@ -1,0 +1,96 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  id="veil-card"
+  viewBox="0 0 1618 1000"
+  role="img"
+  aria-labelledby="veil-card-title veil-card-description"
+>
+  <title id="veil-card-title">Veil</title>
+  <desc id="veil-card-description">
+    A centered Veil wordmark overlapped by a translucent ghost that fades in
+    and out while its wavy hem ripples when the project card is active.
+  </desc>
+
+  <style>
+    .veil-wordmark {
+      fill: #e8e3d5;
+      font-family: Geist, Inter, 'Helvetica Neue', Arial, sans-serif;
+      font-size: 318px;
+      font-weight: 720;
+      letter-spacing: -0.06em;
+    }
+
+    .veil-ghost {
+      opacity: 0;
+      animation: veil-ghost-fade 1s ease-in-out infinite alternate both;
+    }
+
+    .veil-ghost-body {
+      fill: #e8e3d5;
+    }
+
+    .veil-ghost-hem {
+      fill: #e8e3d5;
+      animation: veil-ghost-wave 900ms linear infinite both;
+    }
+
+    .veil-ghost-eye {
+      fill: #0e0e0d;
+    }
+
+    @keyframes veil-ghost-fade {
+      from {
+        opacity: 0;
+      }
+      to {
+        opacity: 0.5;
+      }
+    }
+
+    @keyframes veil-ghost-wave {
+      to {
+        transform: translateX(-192px);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .veil-ghost,
+      .veil-ghost-hem {
+        animation: none;
+      }
+
+      .veil-ghost {
+        opacity: 0.5;
+      }
+    }
+  </style>
+
+  <text
+    class="veil-wordmark"
+    x="809"
+    y="602"
+    text-anchor="middle"
+    aria-label="Veil"
+  >veil</text>
+
+  <defs>
+    <clipPath id="veil-ghost-hem-clip">
+      <rect x="557" y="620" width="504" height="200" />
+    </clipPath>
+  </defs>
+
+  <g class="veil-ghost" aria-label="Translucent ghost">
+    <path
+      class="veil-ghost-body"
+      d="M557 660V434C557 274 662 168 809 168C956 168 1061 274 1061 434V660Z"
+    />
+    <g clip-path="url(#veil-ghost-hem-clip)">
+      <path
+        class="veil-ghost-hem"
+        d="M365 620H1253V738C1221 674 1189 674 1157 738C1125 802 1093 802 1061 738C1029 674 997 674 965 738C933 802 901 802 869 738C837 674 805 674 773 738C741 802 709 802 677 738C645 674 613 674 581 738C549 802 517 802 485 738C453 674 421 674 389 738L365 738Z"
+      />
+    </g>
+    <ellipse class="veil-ghost-eye" cx="731" cy="446" rx="32" ry="48" />
+    <ellipse class="veil-ghost-eye" cx="887" cy="446" rx="32" ry="48" />
+  </g>
+</svg>

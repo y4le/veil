@@ -60,14 +60,22 @@ body {
 
 .masthead { padding-bottom: 1.4rem; border-bottom: 1px solid var(--rule-strong); }
 
-.wordmark {
+.publisher-brand {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
   font-family: var(--mono);
-  font-size: .78rem;
-  letter-spacing: .16em;
-  text-transform: uppercase;
-  color: var(--muted);
+  font-size: max(.78rem, 12px);
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.25;
+  color: var(--ink);
+  border-bottom-color: transparent;
+  padding-bottom: 0;
 }
-.wordmark b { color: var(--ink); font-weight: 400; }
+.publisher-brand-period { color: var(--accent); }
+.publisher-brand:hover { color: var(--ink); border-bottom-color: var(--rule-strong); }
+.publisher-brand:focus-visible { outline-width: 2px; }
 
 h1 {
   margin-top: 1.6rem;
