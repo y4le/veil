@@ -60,6 +60,12 @@ body {
 
 .masthead { padding-bottom: 1.4rem; border-bottom: 1px solid var(--rule-strong); }
 
+.publisher-links {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
 .publisher-brand {
   display: inline-flex;
   align-items: center;
@@ -76,6 +82,16 @@ body {
 .publisher-brand-period { color: var(--accent); }
 .publisher-brand:hover { color: var(--ink); border-bottom-color: var(--rule-strong); }
 .publisher-brand:focus-visible { outline-width: 2px; }
+
+.publisher-git {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  font-family: var(--mono);
+  font-size: max(.78rem, 12px);
+  line-height: 1.25;
+  color: var(--muted);
+}
 
 h1 {
   margin-top: 1.6rem;
