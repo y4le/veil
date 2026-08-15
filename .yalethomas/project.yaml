@@ -13,6 +13,6 @@ type: tool
 tags:
   - static sites
   - encryption
-  - Web Crypto
+  - web crypto
   - Node.js
 svg: .yalethomas/card.svg
